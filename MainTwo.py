@@ -14,7 +14,7 @@ except Exception:
     H5PY_AVAILABLE = False
 from PyQt5.QtWidgets import (QApplication, QMainWindow, QWidget, QVBoxLayout, 
                              QHBoxLayout, QPushButton, QLabel, QFileDialog, 
-                             QStackedWidget, QSlider, QMessageBox, QProgressBar, QComboBox, QScrollArea)
+                             QStackedWidget, QSlider, QMessageBox, QProgressBar, QComboBox, QScrollArea, QSpinBox)
 from PyQt5.QtCore import Qt, QThread, pyqtSignal, QTimer, QEvent
 from PyQt5.QtGui import QImage, QPixmap, QPainter, QColor, QPen, QFont
 from queue import Queue, Empty
@@ -98,12 +98,14 @@ class TrackerWorker(QThread):
     progress = pyqtSignal(int) # Optional: to show progress if you added a bar
     error = pyqtSignal(str)
 
-    def __init__(self, video_path, device, scaled_blob_centers, colors=None, model_size='base'):
+    def __init__(self, video_path, device, scaled_blob_centers, colors=None, model_size='base', start_frame=0, end_frame=None):
         super().__init__()
         self.video_path = video_path
         self.device = device
         self.scaled_blob_centers = scaled_blob_centers
         self.model_size = model_size
+        self.start_frame = int(start_frame) if start_frame is not None else 0
+        self.end_frame = int(end_frame) if end_frame is not None else None
         # Colors can be passed in; if not, fall back to random colors
         if colors is None:
             self.colors = np.random.randint(0, 255, (100, 3), dtype=np.uint8)
@@ -139,6 +141,7 @@ class TrackerWorker(QThread):
 
             predictor = build_sam2_video_predictor(model_cfg, sam2_checkpoint, device=self.device)
             inference_state = predictor.init_state(video_path=self.video_path)
+            print(f"Initialized inference state w video path: {self.video_path}")
             
             # 3. Add Prompts
             for i, prompts in enumerate(self.scaled_blob_centers):
@@ -147,7 +150,7 @@ class TrackerWorker(QThread):
                 labels = np.ones(points.shape[0], dtype=np.int32)
                 predictor.add_new_points_or_box(
                     inference_state=inference_state,
-                    frame_idx=0,
+                    frame_idx=0, # 0 in the temporary folder
                     obj_id=ann_obj_id,
                     points=points,
                     labels=labels,
@@ -162,31 +165,37 @@ class TrackerWorker(QThread):
             h, w = ref_img.shape[:2]
 
             for out_frame_idx, out_obj_ids, out_mask_logits in predictor.propagate_in_video(inference_state):
+                if out_frame_idx > self.end_frame:
+                    print(f"Reached end frame {self.end_frame}, stopping.")
+                    break
                 
-                # Create a black canvas for the color mask
-                color_mask = np.zeros((h, w, 3), dtype=np.uint8)
+                if out_frame_idx >= self.start_frame:
+                    print(f"Processing frame {out_frame_idx}...")
+                    # Create a black canvas for the color mask
+                    color_mask = np.zeros((h, w, 3), dtype=np.uint8)
 
-                for i, out_obj_id in enumerate(out_obj_ids):
-                    # Get binary mask for this object
-                    mask = (out_mask_logits[i] > 0.0).cpu().numpy().squeeze()
-                    
-                    if mask.sum() > 0:
-                        # Resize if necessary (SAM output safety)
-                        if mask.shape != (h, w):
-                            mask = cv2.resize(mask.astype(np.uint8), (w, h), interpolation=cv2.INTER_NEAREST)
+                    for i, out_obj_id in enumerate(out_obj_ids):
+                        # Get binary mask for this object
+                        mask = (out_mask_logits[i] > 0.0).cpu().numpy().squeeze()
                         
-                        # Get color for this object ID
-                        color = self.colors[out_obj_id % len(self.colors)]
-                        
-                        # Paint the color on the mask
-                        color_mask[mask > 0] = color
+                        if mask.sum() > 0:
+                            # Resize if necessary (SAM output safety)
+                            if mask.shape != (h, w):
+                                mask = cv2.resize(mask.astype(np.uint8), (w, h), interpolation=cv2.INTER_NEAREST)
+                            
+                            # Get color for this object ID
+                            color = self.colors[out_obj_id % len(self.colors)]
+                            
+                            # Paint the color on the mask
+                            color_mask[mask > 0] = color
 
                 # Save the pre-colored mask to the new folder as a compressed JPG
-                # Filename matches frame index: 0.jpg, 1.jpg, etc.
-                save_path = os.path.join(mask_output_dir, f"{out_frame_idx}.jpg")
-                # Use reasonable JPEG quality to keep files small but good-looking
-                cv2.imwrite(save_path, color_mask, [int(cv2.IMWRITE_JPEG_QUALITY), 90])
-            
+                # Only save if within requested start/end frame range
+                    save_path = os.path.join(mask_output_dir, f"{out_frame_idx}.jpg")
+                    # Use reasonable JPEG quality to keep files small but good-looking
+                    cv2.imwrite(save_path, color_mask, [int(cv2.IMWRITE_JPEG_QUALITY), 90])
+                else:
+                    print(f"Skipping frame {out_frame_idx}, before start frame {self.start_frame}.")
             self.finished.emit(mask_output_dir)
 
         except Exception as e:
@@ -233,6 +242,26 @@ class ImageLoader(QThread):
                 self._req_q.put(idx)
             except Exception:
                 pass
+                try:
+                    if hasattr(self, '_realtime_worker') and getattr(self, '_realtime_worker') is not None:
+                        if getattr(self._realtime_worker, '_paused', False):
+                            # resume
+                            try:
+                                self._realtime_worker.resume()
+                                self.btn_pause_realtime.setText("Pause Tracking")
+                                self.status_label.setText("Real-time tracking: resumed")
+                            except Exception:
+                                pass
+                        else:
+                            # pause
+                            try:
+                                self._realtime_worker.pause()
+                                self.btn_pause_realtime.setText("Resume Tracking")
+                                self.status_label.setText("Real-time tracking: paused")
+                            except Exception:
+                                pass
+                except Exception:
+                    pass
 
     def run(self):
         while self._running:
@@ -333,18 +362,6 @@ class ImageLoader(QThread):
             self._req_q.put(None)
         except Exception:
             pass
-        # close any open HDF5 handle
-        try:
-            if getattr(self, '_h5f', None) is not None:
-                try:
-                    self._h5f.close()
-                except Exception:
-                    pass
-                self._h5f = None
-        except Exception:
-            pass
-        self.wait()
-
 
 class ExportH5Worker(QThread):
     """Export frames from an HDF5 dataset to a temporary folder as JPEGs.
@@ -352,12 +369,19 @@ class ExportH5Worker(QThread):
     """
     finished = pyqtSignal(str)
     progress = pyqtSignal(int)
+    ready = pyqtSignal(str)
     error = pyqtSignal(str)
 
-    def __init__(self, h5_path, dataset_name=None):
+    def __init__(self, h5_path, start_frame, end_frame, dataset_name=None):
         super().__init__()
         self.h5_path = h5_path
+        self.start_frame = start_frame
+        self.end_frame = end_frame
         self.dataset_name = dataset_name
+        # stream_mode: if True, emit `ready` after writing initial frames so consumer can start
+        self.stream_mode = True
+        self.stream_threshold = 10
+        print(f"Initialized ExportH5Worker with start_frame={start_frame}, end_frame={end_frame}, dataset_name={dataset_name}")
 
     def run(self):
         if not H5PY_AVAILABLE:
@@ -382,9 +406,13 @@ class ExportH5Worker(QThread):
                     return
 
                 ds = f[ds_name]
-                n_frames = ds.shape[0]
+                # n_frames = ds.shape[0]
+                n_frames = self.end_frame - self.start_frame + 1
                 temp_dir = tempfile.mkdtemp(prefix='h5_frames_')
-                for i in range(n_frames):
+                print(f"{self.start_frame}, {self.end_frame}")
+                for i in range(self.start_frame, self.end_frame + 1):
+                    print(f"Exporting frame {i}...")
+
                     try:
                         arr = np.asarray(ds[i])
                         if arr.ndim == 2:
@@ -408,14 +436,151 @@ class ExportH5Worker(QThread):
 
                         save_path = os.path.join(temp_dir, f"{i}.jpg")
                         cv2.imwrite(save_path, out, [int(cv2.IMWRITE_JPEG_QUALITY), 90])
-                        if i % max(1, n_frames // 100) == 0:
-                            pct = int(100.0 * (i+1) / n_frames)
+                        frames_processed = i - self.start_frame + 1
+                        if frames_processed % max(1, n_frames // 100) == 0:
+                            pct = int(100.0 * frames_processed / n_frames)
                             self.progress.emit(pct)
-                    except Exception:
+
+                        # if streaming, emit ready once we've written enough frames to start
+                        print(f"self.stream_mode: {self.stream_mode}, i: {i}, self.stream_threshold: {self.stream_threshold}, self.end_frame: {self.end_frame}")
+                        if self.stream_mode and frames_processed == min(self.stream_threshold, n_frames):
+                            try:
+                                print("Emitting ready signal from ExportH5Worker")
+                                self.ready.emit(temp_dir)
+                            except Exception:
+                                pass
+                    except Exception as e:
+                        print(f"Skipping processing frame {i}: {e}")
                         # skip problematic frames
                         continue
 
             self.finished.emit(temp_dir)
+        except Exception as e:
+            import traceback
+            traceback.print_exc()
+            self.error.emit(str(e))
+
+class RealTimeTrackerWorker(QThread):
+    """Tracker that emits masks per-frame so GUI can display them in real time.
+    Signals:
+      frameMask(int, np.ndarray): emits (frame_idx, color_mask_bgr)
+      finished(str): emits mask folder path when done
+      error(str)
+    Supports pause()/resume()/stop().
+    """
+    frameMask = pyqtSignal(int, object)
+    finished = pyqtSignal(str)
+    error = pyqtSignal(str)
+
+    def __init__(self, video_path, device, scaled_blob_centers, colors=None, model_size='base', start_frame=0, end_frame=None):
+        super().__init__()
+        self.video_path = video_path
+        self.device = device
+        self.scaled_blob_centers = scaled_blob_centers
+        self.model_size = model_size
+        self._running = True
+        self._paused = False
+        self.start_frame = int(start_frame) if start_frame is not None else 0
+        self.end_frame = int(end_frame) if end_frame is not None else None
+        if colors is None:
+            self.colors = np.random.randint(0, 255, (100, 3), dtype=np.uint8)
+        else:
+            self.colors = colors
+
+    def pause(self):
+        self._paused = True
+
+    def resume(self):
+        self._paused = False
+
+    def stop(self):
+        self._running = False
+
+    def run(self):
+        try:
+            # similar init to TrackerWorker
+            video_dir_name = os.path.basename(os.path.normpath(self.video_path))
+            parent_dir = os.path.dirname(os.path.normpath(self.video_path))
+            mask_output_dir = os.path.join(parent_dir, f"{video_dir_name}_masks")
+            os.makedirs(mask_output_dir, exist_ok=True)
+
+            model_size = getattr(self, 'model_size', 'base')
+            if model_size == 'tiny':
+                sam2_checkpoint = "./checkpoints/sam2.1_hiera_tiny.pt"
+                model_cfg = "configs/sam2.1/sam2.1_hiera_t.yaml"
+            elif model_size == 'base':
+                sam2_checkpoint = "./checkpoints/sam2.1_hiera_base_plus.pt"
+                model_cfg = "configs/sam2.1/sam2.1_hiera_b+.yaml"
+            elif model_size == 'large':
+                sam2_checkpoint = "./checkpoints/sam2.1_hiera_large.pt"
+                model_cfg = "configs/sam2.1/sam2.1_hiera_l.yaml"
+            else:
+                self.error.emit(f"Unknown model size: {model_size}")
+                return
+
+            if not os.path.exists(sam2_checkpoint):
+                self.error.emit(f"Checkpoint not found: {sam2_checkpoint}")
+                return
+
+            predictor = build_sam2_video_predictor(model_cfg, sam2_checkpoint, device=self.device)
+            inference_state = predictor.init_state(video_path=self.video_path)
+
+            # add prompts
+            for i, prompts in enumerate(self.scaled_blob_centers):
+                ann_obj_id = i + 1
+                points = np.array(prompts, dtype=np.float32)
+                labels = np.ones(points.shape[0], dtype=np.int32)
+                predictor.add_new_points_or_box(
+                    inference_state=inference_state,
+                    frame_idx=0,
+                    obj_id=ann_obj_id,
+                    points=points,
+                    labels=labels,
+                )
+
+            # propagate and emit per-frame
+            # get image dims
+            first_frame_path = os.path.join(self.video_path, sorted(os.listdir(self.video_path))[0])
+            ref_img = cv2.imread(first_frame_path)
+            h, w = ref_img.shape[:2]
+
+            for out_frame_idx, out_obj_ids, out_mask_logits in predictor.propagate_in_video(inference_state):
+                if not self._running:
+                    break
+
+                # respect pause
+                while self._paused and self._running:
+                    QThread.msleep(100)
+
+                # assemble color mask
+                color_mask = np.zeros((h, w, 3), dtype=np.uint8)
+                for i, out_obj_id in enumerate(out_obj_ids):
+                    mask = (out_mask_logits[i] > 0.0).cpu().numpy().squeeze()
+                    if mask.sum() > 0:
+                        if mask.shape != (h, w):
+                            mask = cv2.resize(mask.astype(np.uint8), (w, h), interpolation=cv2.INTER_NEAREST)
+                        color = self.colors[out_obj_id % len(self.colors)]
+                        color_mask[mask > 0] = color
+
+                # emit for GUI to display (only if within range)
+                if out_frame_idx >= self.start_frame and (self.end_frame is None or out_frame_idx <= self.end_frame):
+                    try:
+                        self.frameMask.emit(out_frame_idx, color_mask.copy())
+                    except Exception:
+                        pass
+                    # save mask
+                    save_path = os.path.join(mask_output_dir, f"{out_frame_idx}.jpg")
+                    try:
+                        cv2.imwrite(save_path, color_mask, [int(cv2.IMWRITE_JPEG_QUALITY), 90])
+                    except Exception:
+                        pass
+
+                # stop early if we've passed end_frame
+                if self.end_frame is not None and out_frame_idx > self.end_frame:
+                    break
+
+            # finished
+            self.finished.emit(mask_output_dir)
         except Exception as e:
             import traceback
             traceback.print_exc()
@@ -435,7 +600,9 @@ class C_Elegans_GUI(QMainWindow):
         self._last_loaded_rgb = None
         # hovered prompt point state: (obj_idx, point_idx) or None
         self._hovered_point = None
-        self.blob_centers = None # Stores result of Autosegment
+        # Prompts storage: map frame_idx -> list of objects -> list of (x,y) points
+        self.blob_centers_by_frame = {}
+        self.blob_centers = None # legacy pointer (not used directly)
         self.autoseg_frame_idx = None
         self.tracking_results = None # Stores result of SAM 2
         self.colors = np.random.randint(0, 255, (100, 3), dtype=np.uint8) # Pre-generate 100 random colors
@@ -571,6 +738,16 @@ class C_Elegans_GUI(QMainWindow):
             self._prefetch_neighbors(self.current_frame_idx)
         except Exception:
             pass
+        # update left-sidebar spinboxes if present
+        try:
+            if hasattr(self, 'end_spin'):
+                self.end_spin.setMaximum(max(0, n_frames - 1))
+                self.end_spin.setValue(max(0, n_frames - 1))
+            if hasattr(self, 'start_spin'):
+                self.start_spin.setMaximum(max(0, n_frames - 1))
+                self.start_spin.setValue(0)
+        except Exception:
+            pass
 
     def setup_tracking_screen(self):
         self.tracking_widget = QWidget()
@@ -607,7 +784,79 @@ class C_Elegans_GUI(QMainWindow):
         self.image_label.installEventFilter(self)
 
         # Place image and sidebar side-by-side
+        # Left: control sidebar (track buttons + start/end frame)
+        self.left_sidebar = QWidget()
+        self.left_layout = QVBoxLayout()
+        self.left_layout.setAlignment(Qt.AlignTop)
+        self.left_sidebar.setLayout(self.left_layout)
+
+        self.left_layout.addWidget(QLabel("Tracking Range:"))
+        
+        # Start frame row
+        start_row_widget = QWidget()
+        start_row_layout = QHBoxLayout()
+        start_row_layout.setContentsMargins(0, 0, 0, 0)
+        start_row_widget.setLayout(start_row_layout)
+        start_row_layout.addWidget(QLabel("Start:"))
+        self.start_spin = QSpinBox()
+        self.start_spin.setMinimum(0)
+        self.start_spin.setMaximum(0)
+        self.start_spin.setValue(0)
+        start_row_layout.addWidget(self.start_spin)
+        btn_set_start = QPushButton("Set to Curr")
+        btn_set_start.setFixedWidth(80)
+        btn_set_start.clicked.connect(lambda: self.start_spin.setValue(self.current_frame_idx))
+        start_row_layout.addWidget(btn_set_start)
+        start_row_layout.addStretch()
+        self.left_layout.addWidget(start_row_widget)
+        
+        # End frame row
+        end_row_widget = QWidget()
+        end_row_layout = QHBoxLayout()
+        end_row_layout.setContentsMargins(0, 0, 0, 0)
+        end_row_widget.setLayout(end_row_layout)
+        end_row_layout.addWidget(QLabel("End:"))
+        self.end_spin = QSpinBox()
+        self.end_spin.setMinimum(0)
+        self.end_spin.setMaximum(0)
+        self.end_spin.setValue(0)
+        end_row_layout.addWidget(self.end_spin)
+        btn_set_end = QPushButton("Set to Curr")
+        btn_set_end.setFixedWidth(80)
+        btn_set_end.clicked.connect(lambda: self.end_spin.setValue(self.current_frame_idx))
+        end_row_layout.addWidget(btn_set_end)
+        end_row_layout.addStretch()
+        self.left_layout.addWidget(end_row_widget)
+
+
+        # Buttons
+        btn_layout = QHBoxLayout()
+        
+        self.btn_autosegment = QPushButton("Autosegment worms (Frame 1)")
+        self.btn_autosegment.clicked.connect(self.run_autosegmentation)
+        
+        self.btn_track = QPushButton("Track")
+        self.btn_track.clicked.connect(self.run_tracking)
+        self.btn_track.setEnabled(False) # Disabled until autosegment is done
+
+        # Real-time tracking buttons
+        self.btn_track_realtime = QPushButton("Track in Real Time")
+        self.btn_track_realtime.clicked.connect(self.run_tracking_realtime)
+        self.btn_track_realtime.setEnabled(False)
+
+        self.btn_pause_realtime = QPushButton("Pause Tracking")
+        self.btn_pause_realtime.setEnabled(False)
+        self.btn_pause_realtime.clicked.connect(self.toggle_realtime_pause)
+
+        # Move tracking buttons into left sidebar
+        self.left_layout.addSpacing(10)
+        self.left_layout.addWidget(self.btn_autosegment)
+        self.left_layout.addWidget(self.btn_track)
+        self.left_layout.addWidget(self.btn_track_realtime)
+        self.left_layout.addWidget(self.btn_pause_realtime)
+
         top_hlayout = QHBoxLayout()
+        top_hlayout.addWidget(self.left_sidebar)
         top_hlayout.addWidget(self.image_label, stretch=1)
         top_hlayout.addWidget(self.sidebar_area)
         layout.addLayout(top_hlayout)
@@ -620,7 +869,8 @@ class C_Elegans_GUI(QMainWindow):
         self.slider.setValue(0)
         self.slider.setEnabled(False)
         self.slider.valueChanged.connect(self.on_slider_change)
-        controls_layout.addWidget(QLabel("Frame:"))
+        self.frame_label = QLabel("Frame: ")
+        controls_layout.addWidget(self.frame_label)
         controls_layout.addWidget(self.slider)
 
         # Play / Pause button next to the slider
@@ -641,19 +891,11 @@ class C_Elegans_GUI(QMainWindow):
 
         layout.addLayout(controls_layout)
 
-        # Buttons
-        btn_layout = QHBoxLayout()
-        
-        self.btn_autosegment = QPushButton("Autosegment worms (Frame 1)")
-        self.btn_autosegment.clicked.connect(self.run_autosegmentation)
-        
-        self.btn_track = QPushButton("Track")
-        self.btn_track.clicked.connect(self.run_tracking)
-        self.btn_track.setEnabled(False) # Disabled until autosegment is done
-
-        btn_layout.addWidget(self.btn_autosegment)
-        btn_layout.addWidget(self.btn_track)
-        layout.addLayout(btn_layout)
+        # btn_layout.addWidget(self.btn_autosegment)
+        # btn_layout.addWidget(self.btn_track)
+        # btn_layout.addWidget(self.btn_track_realtime)
+        # btn_layout.addWidget(self.btn_pause_realtime)
+        # layout.addLayout(btn_layout)
 
         # Status Bar / Progress
         self.status_label = QLabel("Ready")
@@ -701,10 +943,27 @@ class C_Elegans_GUI(QMainWindow):
             self.update_display()
             # clear caches when new folder chosen
             self.clear_pixmap_cache()
+            # update left-sidebar spinboxes if present
+            try:
+                n_frames = len(self.image_files)
+                if hasattr(self, 'end_spin'):
+                    self.end_spin.setMaximum(max(0, n_frames - 1))
+                    self.end_spin.setValue(max(0, n_frames - 1))
+                if hasattr(self, 'start_spin'):
+                    self.start_spin.setMaximum(max(0, n_frames - 1))
+                    self.start_spin.setValue(0)
+            except Exception:
+                pass
 
     def on_slider_change(self, value):
         self.current_frame_idx = value
+        self.frame_label.setText(f"Frame: {value}")
         self.update_display()
+        # refresh object sidebar to show prompts for the newly-selected frame
+        try:
+            self.update_object_sidebar()
+        except Exception:
+            pass
         # request prefetch of neighbors
         self._prefetch_neighbors(self.current_frame_idx)
 
@@ -728,18 +987,21 @@ class C_Elegans_GUI(QMainWindow):
         
         # Run user's logic
         try:
-            self.blob_centers = process_image_and_scale_centers(img, downsample_resolution=8, num_skeleton_points=10)
+            prompts = process_image_and_scale_centers(img, downsample_resolution=8, num_skeleton_points=10)
+            # store prompts for this frame
+            self.blob_centers_by_frame[target_idx] = prompts
             # mark which frame these prompts belong to
             self.autoseg_frame_idx = target_idx
 
-            # Update the object sidebar with buttons for each detected object
+            # Update the object sidebar with buttons for each detected object (for current frame)
             try:
                 self.update_object_sidebar()
             except Exception:
                 pass
 
-            self.status_label.setText(f"Found {len(self.blob_centers)} worms. Ready to Track.")
-            self.btn_track.setEnabled(True)
+            curr_prompts = self.blob_centers_by_frame.get(target_idx, [])
+            self.status_label.setText(f"Found {len(curr_prompts)} worms. Ready to Track.")
+            self.btn_track.setEnabled(True if len(curr_prompts) > 0 else False)
 
             # Remove any cached pixmap for that frame (it may have been created before autoseg)
             try:
@@ -758,7 +1020,7 @@ class C_Elegans_GUI(QMainWindow):
                 text_bgr = (255, 255, 255)
                 outline_bgr = (0, 0, 0)
 
-                for i_obj, skeleton_pts in enumerate(self.blob_centers):
+                for i_obj, skeleton_pts in enumerate(curr_prompts):
                     color_rgb = tuple(map(int, self.colors[(i_obj + 1) % len(self.colors)]))
                     color_bgr = (int(color_rgb[2]), int(color_rgb[1]), int(color_rgb[0]))
                     is_selected = (self.selected_object_idx is not None and self.selected_object_idx == i_obj)
@@ -832,14 +1094,34 @@ class C_Elegans_GUI(QMainWindow):
 
         # If dataset was loaded from HDF5, export frames to a temporary folder first
         if getattr(self, 'h5_file_path', None) is not None:
+            # check that prompts exist for requested start frame before exporting
+            try:
+                start_frame = int(self.start_spin.value()) if hasattr(self, 'start_spin') else 0
+            except Exception:
+                start_frame = 0
+            if not self.blob_centers_by_frame.get(start_frame):
+                QMessageBox.critical(self, "Error", "No prompts for chosen start frame. Please add some prompts.")
+                return
+            
+            try:
+                end_frame = int(self.end_spin.value()) if hasattr(self, 'end_spin') else None
+            except Exception:
+                end_frame = None
+            
+
             # start export worker
             try:
                 self.btn_track.setEnabled(False)
                 self.btn_autosegment.setEnabled(False)
                 self.status_label.setText("Exporting HDF5 frames to temporary folder...")
-                self._export_worker = ExportH5Worker(self.h5_file_path, getattr(self, 'h5_dataset_name', None))
+                self._export_worker = ExportH5Worker(self.h5_file_path, start_frame, end_frame, getattr(self, 'h5_dataset_name', None))
+                self._export_worker.stream_mode = True
+                # show progress
                 self._export_worker.progress.connect(lambda p: self.status_label.setText(f"Exporting frames... {p}%"))
-                self._export_worker.finished.connect(self._on_h5_export_finished)
+                # when stream ready, start tracker (but keep exporting remaining frames)
+                self._export_worker.ready.connect(self._on_h5_export_ready)
+                # when finished, still call on_tracking_finished so masks can be indexed
+                self._export_worker.finished.connect(self.on_tracking_finished)
                 self._export_worker.error.connect(self.on_tracking_error)
                 self._export_worker.start()
                 return
@@ -847,16 +1129,116 @@ class C_Elegans_GUI(QMainWindow):
                 QMessageBox.critical(self, "Error", f"Failed to start HDF5 export: {e}")
                 return
 
-        # normal folder-based tracking
-        self._start_tracker_worker(self.video_path)
+        # determine requested frame range from spinboxes (if present)
+        try:
+            start_frame = int(self.start_spin.value()) if hasattr(self, 'start_spin') else 0
+            end_frame = int(self.end_spin.value()) if hasattr(self, 'end_spin') else None
+        except Exception:
+            start_frame = 0
+            end_frame = None
 
-    def _start_tracker_worker(self, video_folder):
+        # normal folder-based tracking
+        self._start_tracker_worker(self.video_path, start_frame=start_frame, end_frame=end_frame)
+
+    def run_tracking_realtime(self):
+        """Start real-time tracking: export HDF5 if needed, otherwise start realtime worker on folder."""
+        if not SAM2_AVAILABLE:
+            QMessageBox.critical(self, "Error", "SAM 2 library is not installed/importable.")
+            return
+
+        # if HDF5 source, export first
+        if getattr(self, 'h5_file_path', None) is not None:
+            # check that prompts exist for requested start frame before exporting
+            try:
+                start_frame = int(self.start_spin.value()) if hasattr(self, 'start_spin') else 0
+            except Exception:
+                start_frame = 0
+            if not self.blob_centers_by_frame.get(start_frame):
+                QMessageBox.critical(self, "Error", "No prompts for chosen start frame. Please add some prompts.")
+                return
+            try:
+                self.btn_track_realtime.setEnabled(False)
+                self.btn_autosegment.setEnabled(False)
+                self.status_label.setText("Exporting HDF5 frames to temporary folder for real-time tracking...")
+                self._export_worker = ExportH5Worker(self.h5_file_path, getattr(self, 'h5_dataset_name', None))
+                self._export_worker.stream_mode = True
+                self._export_worker.progress.connect(lambda p: self.status_label.setText(f"Exporting frames... {p}%"))
+                self._export_worker.ready.connect(self._on_h5_export_finished_realtime)
+                self._export_worker.finished.connect(self.on_tracking_finished)
+                self._export_worker.error.connect(self.on_tracking_error)
+                self._export_worker.start()
+                return
+            except Exception as e:
+                QMessageBox.critical(self, "Error", f"Failed to start HDF5 export: {e}")
+                return
+
+        # determine requested frame range from spinboxes (if present)
+        try:
+            start_frame = int(self.start_spin.value()) if hasattr(self, 'start_spin') else 0
+            end_frame = int(self.end_spin.value()) if hasattr(self, 'end_spin') else None
+        except Exception:
+            start_frame = 0
+            end_frame = None
+
+        # start realtime on folder
+        self._start_realtime_worker(self.video_path, start_frame=start_frame, end_frame=end_frame)
+
+    def _on_h5_export_finished_realtime(self, temp_folder):
+        # save export tempdir so cleanup happens later
+        self._h5_export_tempdir = temp_folder
+        # get requested start/end
+        try:
+            start_frame = int(self.start_spin.value()) if hasattr(self, 'start_spin') else 0
+            end_frame = int(self.end_spin.value()) if hasattr(self, 'end_spin') else None
+        except Exception:
+            start_frame = 0
+            end_frame = None
+        self._start_realtime_worker(temp_folder, start_frame=start_frame, end_frame=end_frame)
+
+    def _start_realtime_worker(self, video_folder, start_frame=0, end_frame=None):
+        try:
+            self.btn_track_realtime.setEnabled(False)
+            self.btn_pause_realtime.setEnabled(True)
+            self.btn_track.setEnabled(False)
+            self.btn_autosegment.setEnabled(False)
+            self.status_label.setText("Real-time tracking...")
+            # fetch prompts for the requested start frame
+            prompts = self.blob_centers_by_frame.get(start_frame)
+            if not prompts:
+                QMessageBox.critical(self, "Error", "No prompts for chosen start frame. Please add some prompts.")
+                # re-enable UI
+                self.btn_track_realtime.setEnabled(True)
+                self.btn_pause_realtime.setEnabled(False)
+                self.btn_autosegment.setEnabled(True)
+                return
+
+            self._realtime_worker = RealTimeTrackerWorker(video_folder, self.device, prompts, colors=self.colors, model_size=getattr(self, 'model_size', 'base'), start_frame=start_frame, end_frame=end_frame)
+            self._realtime_worker.frameMask.connect(self._on_realtime_frame)
+            self._realtime_worker.finished.connect(self.on_tracking_finished)
+            self._realtime_worker.error.connect(self.on_tracking_error)
+            self._realtime_worker.start()
+        except Exception as e:
+            QMessageBox.critical(self, "Error", f"Failed to start realtime tracker: {e}")
+            self.btn_track_realtime.setEnabled(True)
+            self.btn_pause_realtime.setEnabled(False)
+            self.btn_autosegment.setEnabled(True)
+
+    def _start_tracker_worker(self, video_folder, start_frame=0, end_frame=None):
         """Start the TrackerWorker using the given video_folder path."""
         try:
             self.btn_track.setEnabled(False)
             self.btn_autosegment.setEnabled(False)
             self.status_label.setText("Tracking in progress... This may take a moment.")
-            self.worker = TrackerWorker(video_folder, self.device, self.blob_centers, colors=self.colors, model_size=getattr(self, 'model_size', 'base'))
+            print(f"Starting tracker for frames {start_frame} to {end_frame}")
+            # fetch prompts for the requested start frame
+            prompts = self.blob_centers_by_frame.get(start_frame)
+            if not prompts:
+                QMessageBox.critical(self, "Error", "No prompts for chosen start frame. Please add some prompts.")
+                self.btn_track.setEnabled(True)
+                self.btn_autosegment.setEnabled(True)
+                return
+
+            self.worker = TrackerWorker(video_folder, self.device, prompts, colors=self.colors, model_size=getattr(self, 'model_size', 'base'), start_frame=start_frame, end_frame=end_frame)
             self.worker.finished.connect(self.on_tracking_finished)
             self.worker.error.connect(self.on_tracking_error)
             self.worker.start()
@@ -888,7 +1270,8 @@ class C_Elegans_GUI(QMainWindow):
             q_img = QImage(img_rgb.data, w, h, bytes_per_line, QImage.Format_RGB888)
 
             # Draw skeleton markers for the autosegmentation frame if available
-            if self.autoseg_frame_idx is not None and idx == self.autoseg_frame_idx and self.blob_centers:
+            prompts_for_idx = self.blob_centers_by_frame.get(idx)
+            if self.autoseg_frame_idx is not None and idx == self.autoseg_frame_idx and prompts_for_idx:
                 # Draw filled circles and labels so markers are visible over masks
                 # Convert RGB->BGR for OpenCV drawing, then back to RGB
                 img_bgr = cv2.cvtColor(img_rgb, cv2.COLOR_RGB2BGR)
@@ -898,7 +1281,7 @@ class C_Elegans_GUI(QMainWindow):
                 text_bgr = (255, 255, 255)
                 outline_bgr = (0, 0, 0)
 
-                for i_obj, skeleton_pts in enumerate(self.blob_centers):
+                for i_obj, skeleton_pts in enumerate(prompts_for_idx):
                     try:
                         is_selected = (self.selected_object_idx is not None and self.selected_object_idx == i_obj)
                         color_rgb = tuple(map(int, self.colors[(i_obj + 1) % len(self.colors)]))
@@ -1058,6 +1441,85 @@ class C_Elegans_GUI(QMainWindow):
 
         self.update_display()
 
+    def _on_realtime_frame(self, idx, color_mask_bgr):
+        """Receive per-frame color mask from realtime worker and display it immediately."""
+        try:
+            # read base image for this frame (folder-backed)
+            if self.image_files:
+                img_path = self.image_files[idx]
+                img = cv2.imread(img_path)
+            elif getattr(self, 'h5_file_path', None) and H5PY_AVAILABLE:
+                # load from HDF5 directly for display
+                try:
+                    with h5py.File(self.h5_file_path, 'r') as f:
+                        ds = self.h5_dataset_name if getattr(self, 'h5_dataset_name', None) is not None else next(iter(f.keys()))
+                        arr = np.asarray(f[ds][idx])
+                        if arr.ndim == 2:
+                            img = cv2.cvtColor(arr.astype(np.uint8), cv2.COLOR_GRAY2BGR)
+                        else:
+                            if arr.dtype != np.uint8:
+                                m = arr.max() if arr.max() != 0 else 1.0
+                                img = (255.0 * (arr.astype(np.float32) / m)).astype(np.uint8)
+                            else:
+                                img = arr.astype(np.uint8)
+                            if img.shape[2] == 3:
+                                # assume RGB in HDF5
+                                img = cv2.cvtColor(img, cv2.COLOR_RGB2BGR)
+                except Exception:
+                    return
+            else:
+                return
+
+            if img is None:
+                return
+
+            # compose color mask onto image (both BGR)
+            mask = color_mask_bgr
+            if mask.shape[:2] != img.shape[:2]:
+                mask = cv2.resize(mask, (img.shape[1], img.shape[0]), interpolation=cv2.INTER_NEAREST)
+            mask_indices = np.any(mask != [0, 0, 0], axis=-1)
+            composed = img.copy()
+            composed[mask_indices] = cv2.addWeighted(composed[mask_indices], 0.5, mask[mask_indices], 0.5, 0)
+
+            # convert to RGB and display
+            img_rgb = cv2.cvtColor(composed, cv2.COLOR_BGR2RGB)
+            img_rgb = np.ascontiguousarray(img_rgb)
+            h, w, ch = img_rgb.shape
+            bytes_per_line = ch * w
+            q_img = QImage(img_rgb.data, w, h, bytes_per_line, QImage.Format_RGB888)
+            pixmap = QPixmap.fromImage(q_img)
+            scaled = pixmap.scaled(self.image_label.size(), Qt.KeepAspectRatio, Qt.SmoothTransformation)
+
+            # cache it (LRU)
+            try:
+                if len(self.pixmap_cache) >= self.pixmap_cache_max:
+                    try:
+                        self.pixmap_cache.popitem(last=False)
+                    except Exception:
+                        first_key = next(iter(self.pixmap_cache))
+                        self.pixmap_cache.pop(first_key, None)
+                self.pixmap_cache[idx] = scaled
+                try:
+                    self.pixmap_cache.move_to_end(idx, last=True)
+                except Exception:
+                    pass
+            except Exception:
+                self.pixmap_cache[idx] = scaled
+
+            # display and advance slider
+            self.current_frame_idx = idx
+            try:
+                self.image_label.setPixmap(scaled)
+            except Exception:
+                pass
+            try:
+                # update slider without causing heavy prefetch churn
+                self.slider.setValue(idx)
+            except Exception:
+                pass
+        except Exception:
+            pass
+
     def eventFilter(self, obj, event):
         # handle hover and clicks on the image label
         try:
@@ -1067,7 +1529,9 @@ class C_Elegans_GUI(QMainWindow):
                     # reset hover
                     self._hovered_point = None
                     pixmap = self.image_label.pixmap()
-                    if pixmap is None or not self.blob_centers:
+                    # get prompts for current frame
+                    prompts = self.blob_centers_by_frame.get(self.current_frame_idx, None)
+                    if pixmap is None or not prompts:
                         self.image_label.setCursor(Qt.ArrowCursor)
                         return False
 
@@ -1115,7 +1579,7 @@ class C_Elegans_GUI(QMainWindow):
                     thr = 12
                     found = False
                     # iterate over all points to find nearest
-                    for obj_idx, pts in enumerate(self.blob_centers):
+                    for obj_idx, pts in enumerate(prompts):
                         for pt_idx, (cx, cy) in enumerate(pts):
                             disp_x = int(cx * scale) + offset_x
                             disp_y = int(cy * scale) + offset_y
@@ -1134,12 +1598,9 @@ class C_Elegans_GUI(QMainWindow):
 
                 # Mouse button press: handle different click behaviors
                 if event.type() == QEvent.MouseButtonPress and event.button() == Qt.LeftButton:
-                    # Ctrl+Left: add new object at click (existing behavior)
+                    # Ctrl+Left: add new object at click (allow on any frame)
                     if (event.modifiers() & Qt.ControlModifier):
-                        # only allow adding on the first frame
-                        if self.current_frame_idx != 0:
-                            self.status_label.setText("Ctrl+Click additions only allowed on first frame.")
-                            return True
+                        # allow adding on current frame
 
                         pixmap = self.image_label.pixmap()
                         if pixmap is None:
@@ -1162,11 +1623,11 @@ class C_Elegans_GUI(QMainWindow):
                                 if getattr(self, 'h5_file_path', None) is not None and H5PY_AVAILABLE:
                                     with h5py.File(self.h5_file_path, 'r') as f:
                                         ds = self.h5_dataset_name if getattr(self, 'h5_dataset_name', None) is not None else next(iter(f.keys()))
-                                        arr = f[ds][0]
+                                        arr = f[ds][self.current_frame_idx]
                                         tmp = np.asarray(arr)
                                         orig_h, orig_w = tmp.shape[:2]
                                 else:
-                                    orig = cv2.imread(self.image_files[0])
+                                    orig = cv2.imread(self.image_files[self.current_frame_idx])
                                     if orig is None:
                                         return True
                                     orig_h, orig_w = orig.shape[:2]
@@ -1178,15 +1639,18 @@ class C_Elegans_GUI(QMainWindow):
                         x_orig = int((x_in * orig_w) / pixmap_w)
                         y_orig = int((y_in * orig_h) / pixmap_h)
 
-                        if self.blob_centers is None:
-                            self.blob_centers = []
-                        self.blob_centers.append([(x_orig, y_orig)])
-                        self.autoseg_frame_idx = 0
+                        # append new object prompts for current frame
+                        curr = self.blob_centers_by_frame.get(self.current_frame_idx)
+                        if curr is None:
+                            self.blob_centers_by_frame[self.current_frame_idx] = []
+                            curr = self.blob_centers_by_frame[self.current_frame_idx]
+                        curr.append([(x_orig, y_orig)])
+                        self.autoseg_frame_idx = self.current_frame_idx
                         try:
                             self.update_object_sidebar()
-                            self._image_loader.request(0)
-                            self._prefetch_neighbors(0)
-                            self.slider.setValue(0)
+                            self._image_loader.request(self.current_frame_idx)
+                            self._prefetch_neighbors(self.current_frame_idx)
+                            self.slider.setValue(self.current_frame_idx)
                             self.update_display()
                             self.status_label.setText(f"Added object at ({x_orig},{y_orig})")
                         except Exception:
@@ -1197,11 +1661,12 @@ class C_Elegans_GUI(QMainWindow):
                     if self._hovered_point is not None:
                         obj_idx, pt_idx = self._hovered_point
                         try:
-                            if 0 <= obj_idx < len(self.blob_centers) and 0 <= pt_idx < len(self.blob_centers[obj_idx]):
-                                self.blob_centers[obj_idx].pop(pt_idx)
+                            curr = self.blob_centers_by_frame.get(self.current_frame_idx)
+                            if curr is not None and 0 <= obj_idx < len(curr) and 0 <= pt_idx < len(curr[obj_idx]):
+                                curr[obj_idx].pop(pt_idx)
                                 # if no points left for object, remove object entirely
-                                if len(self.blob_centers[obj_idx]) == 0:
-                                    self.blob_centers.pop(obj_idx)
+                                if len(curr[obj_idx]) == 0:
+                                    curr.pop(obj_idx)
                                     # adjust selected index
                                     if self.selected_object_idx is not None:
                                         if self.selected_object_idx == obj_idx:
@@ -1225,7 +1690,8 @@ class C_Elegans_GUI(QMainWindow):
                         return True
 
                     # Left click without Ctrl and not on a point: if an object is selected, add a prompt point to that object
-                    if self.selected_object_idx is not None and self.blob_centers is not None and self.current_frame_idx == (self.autoseg_frame_idx or self.current_frame_idx):
+                    prompts_here = self.blob_centers_by_frame.get(self.current_frame_idx)
+                    if self.selected_object_idx is not None and prompts_here is not None and 0 <= self.selected_object_idx < len(prompts_here):
                         pixmap = self.image_label.pixmap()
                         if pixmap is None:
                             return False
@@ -1262,8 +1728,8 @@ class C_Elegans_GUI(QMainWindow):
                         y_orig = int((y_in * orig_h) / pixmap_h)
 
                         try:
-                            # append to selected object's prompt list
-                            self.blob_centers[self.selected_object_idx].append((x_orig, y_orig))
+                            # append to selected object's prompt list for current frame
+                            prompts_here[self.selected_object_idx].append((x_orig, y_orig))
                         except Exception:
                             # if selected index invalid, ignore
                             return True
@@ -1301,6 +1767,19 @@ class C_Elegans_GUI(QMainWindow):
                     pass
         except Exception:
             pass
+        # Stop realtime worker if running
+        try:
+            if hasattr(self, '_realtime_worker') and getattr(self, '_realtime_worker') is not None:
+                try:
+                    try:
+                        self._realtime_worker.stop()
+                    except Exception:
+                        pass
+                    self._realtime_worker.wait(1000)
+                except Exception:
+                    pass
+        except Exception:
+            pass
         # remove temporary exported HDF5 frames if present
         try:
             if getattr(self, '_h5_export_tempdir', None):
@@ -1322,10 +1801,36 @@ class C_Elegans_GUI(QMainWindow):
         """Called when ExportH5Worker finishes exporting frames to `temp_folder`."""
         try:
             self._h5_export_tempdir = temp_folder
-            # start tracker with the exported folder
-            self._start_tracker_worker(temp_folder)
+            # determine requested start/end from spinboxes (if present)
+            try:
+                start_frame = int(self.start_spin.value()) if hasattr(self, 'start_spin') else 0
+                end_frame = int(self.end_spin.value()) if hasattr(self, 'end_spin') else None
+            except Exception:
+                start_frame = 0
+                end_frame = None
+            # start tracker with the exported folder and requested range
+            self._start_tracker_worker(temp_folder, start_frame=start_frame, end_frame=end_frame)
         except Exception as e:
             QMessageBox.critical(self, "Error", f"Failed to start tracker after export: {e}")
+            self.btn_track.setEnabled(True)
+            self.btn_autosegment.setEnabled(True)
+
+    def _on_h5_export_ready(self, temp_folder):
+        """Called when exporter has written an initial batch of frames and the tracker can start."""
+        try:
+            # keep tempdir reference so we can cleanup later
+            self._h5_export_tempdir = temp_folder
+            # determine requested start/end from spinboxes (if present)
+            try:
+                start_frame = int(self.start_spin.value()) if hasattr(self, 'start_spin') else 0
+                end_frame = int(self.end_spin.value()) if hasattr(self, 'end_spin') else None
+            except Exception:
+                start_frame = 0
+                end_frame = None
+            # start tracker worker now (the export thread will continue writing remaining frames)
+            self._start_tracker_worker(temp_folder, start_frame=start_frame, end_frame=end_frame)
+        except Exception as e:
+            QMessageBox.critical(self, "Error", f"Failed to start tracker after HDF5 stream ready: {e}")
             self.btn_track.setEnabled(True)
             self.btn_autosegment.setEnabled(True)
 
@@ -1346,6 +1851,43 @@ class C_Elegans_GUI(QMainWindow):
                 if child_layout is not None:
                     self.clear_layout(child_layout)
 
+
+    def toggle_realtime_pause(self):
+        """Toggle pause/resume of the realtime tracker worker."""
+        try:
+            worker = getattr(self, '_realtime_worker', None)
+            if worker is None:
+                return
+            if getattr(worker, '_paused', False):
+                try:
+                    worker.resume()
+                    self.btn_pause_realtime.setText("Pause Tracking")
+                    self.status_label.setText("Real-time tracking: resumed")
+                except Exception:
+                    pass
+            else:
+                try:
+                    worker.pause()
+                    self.btn_pause_realtime.setText("Resume Tracking")
+                    self.status_label.setText("Real-time tracking: paused")
+                except Exception:
+                    pass
+        except Exception:
+            pass
+        # close any open HDF5 handle
+        try:
+            if getattr(self, '_h5f', None) is not None:
+                try:
+                    self._h5f.close()
+                except Exception:
+                    pass
+                self._h5f = None
+        except Exception:
+            pass
+        self.wait()
+
+
+
     # overlay helper was removed per user request
 
     def update_object_sidebar(self):
@@ -1357,49 +1899,63 @@ class C_Elegans_GUI(QMainWindow):
             pass
 
         self.object_buttons = []
-
-        if not self.blob_centers:
+        # show prompts for the current frame (if any)
+        prompts = self.blob_centers_by_frame.get(self.current_frame_idx)
+        if not prompts:
             lbl = QLabel("No objects detected")
             self.object_button_layout.addWidget(lbl)
-            return
+        else:
+            # create a row for each object: [Object btn] [Delete btn]
+            for i_obj, skeleton_pts in enumerate(prompts):
+                row_widget = QWidget()
+                row_layout = QHBoxLayout()
+                row_layout.setContentsMargins(0, 0, 0, 0)
 
-        # create a row for each object: [Object btn] [Delete btn]
-        for i_obj, skeleton_pts in enumerate(self.blob_centers):
-            row_widget = QWidget()
-            row_layout = QHBoxLayout()
-            row_layout.setContentsMargins(0, 0, 0, 0)
+                btn = QPushButton(f"Worm {i_obj+1}")
+                btn.setFixedHeight(30)
+                btn.setMinimumWidth(140)
 
-            btn = QPushButton(f"Worm {i_obj+1}")
-            btn.setFixedHeight(30)
-            btn.setMinimumWidth(140)
+                # color chosen in same way as drawing code (use object id +1)
+                color_rgb = tuple(map(int, self.colors[(i_obj + 1) % len(self.colors)]))
+                r, g, b = color_rgb
 
-            # color chosen in same way as drawing code (use object id +1)
-            color_rgb = tuple(map(int, self.colors[(i_obj + 1) % len(self.colors)]))
-            r, g, b = color_rgb
+                # choose text color based on luminance for readability
+                luminance = 0.299 * r + 0.587 * g + 0.114 * b
+                text_color = '#000000' if luminance > 180 else '#FFFFFF'
 
-            # choose text color based on luminance for readability
-            luminance = 0.299 * r + 0.587 * g + 0.114 * b
-            text_color = '#000000' if luminance > 180 else '#FFFFFF'
+                base_style = f"background-color: rgb({r},{g},{b}); color: {text_color}; border-radius: 6px;"
+                btn.setStyleSheet(base_style)
+                btn.clicked.connect(lambda _, idx=i_obj: self.on_object_button_clicked(idx))
 
-            base_style = f"background-color: rgb({r},{g},{b}); color: {text_color}; border-radius: 6px;"
-            btn.setStyleSheet(base_style)
-            btn.clicked.connect(lambda _, idx=i_obj: self.on_object_button_clicked(idx))
+                # delete button
+                del_btn = QPushButton("✕")
+                del_btn.setFixedSize(28, 28)
+                del_btn.setStyleSheet("background-color: #ff4d4d; color: #fff; border-radius: 4px;")
+                del_btn.clicked.connect(lambda _, idx=i_obj: self.delete_object(idx))
 
-            # delete button
-            del_btn = QPushButton("✕")
-            del_btn.setFixedSize(28, 28)
-            del_btn.setStyleSheet("background-color: #ff4d4d; color: #fff; border-radius: 4px;")
-            del_btn.clicked.connect(lambda _, idx=i_obj: self.delete_object(idx))
+                row_layout.addWidget(btn)
+                row_layout.addWidget(del_btn)
+                row_widget.setLayout(row_layout)
 
-            row_layout.addWidget(btn)
-            row_layout.addWidget(del_btn)
-            row_widget.setLayout(row_layout)
-
-            self.object_buttons.append(btn)
-            self.object_button_layout.addWidget(row_widget)
+                self.object_buttons.append(btn)
+                self.object_button_layout.addWidget(row_widget)
 
         # add stretch to push buttons to top
         self.object_button_layout.addStretch(1)
+        # enable Track buttons when we have at least one object
+        try:
+            # enable if any frame has objects (global) so user can start tracking from a chosen start frame
+            has_objects = any(len(v) > 0 for v in self.blob_centers_by_frame.values())
+            try:
+                self.btn_track.setEnabled(has_objects)
+            except Exception:
+                pass
+            try:
+                self.btn_track_realtime.setEnabled(has_objects)
+            except Exception:
+                pass
+        except Exception:
+            pass
 
     def on_object_button_clicked(self, idx):
         """Handle object button click: mark selected and update UI."""
@@ -1422,8 +1978,8 @@ class C_Elegans_GUI(QMainWindow):
             except Exception:
                 pass
 
-        # Determine which frame to refresh (autoseg frame preferred)
-        target = self.autoseg_frame_idx if self.autoseg_frame_idx is not None else self.current_frame_idx
+        # Determine which frame to refresh (use current frame)
+        target = self.current_frame_idx
 
         # Invalidate any existing scaled pixmap for that frame so update_display won't reuse stale image
         try:
@@ -1446,7 +2002,8 @@ class C_Elegans_GUI(QMainWindow):
                     text_bgr = (255, 255, 255)
                     outline_bgr = (0, 0, 0)
 
-                    for i_obj, skeleton_pts in enumerate(self.blob_centers or []):
+                    prompts_here = self.blob_centers_by_frame.get(target, [])
+                    for i_obj, skeleton_pts in enumerate(prompts_here or []):
                         is_selected = (self.selected_object_idx is not None and self.selected_object_idx == i_obj)
                         color_rgb = tuple(map(int, self.colors[(i_obj + 1) % len(self.colors)]))
                         color_bgr = (int(color_rgb[2]), int(color_rgb[1]), int(color_rgb[0]))
@@ -1510,18 +2067,20 @@ class C_Elegans_GUI(QMainWindow):
 
     def delete_object(self, idx):
         """Delete object at index `idx` from blob_centers and refresh UI."""
-        if not self.blob_centers:
+        # operate on prompts for the current frame
+        prompts_here = self.blob_centers_by_frame.get(self.current_frame_idx)
+        if not prompts_here:
             return
         try:
             # Remove the selected blob
-            if 0 <= idx < len(self.blob_centers):
-                self.blob_centers.pop(idx)
+            if 0 <= idx < len(prompts_here):
+                prompts_here.pop(idx)
         except Exception:
             pass
 
         # reset selected index if out of range
         if self.selected_object_idx is not None:
-            if self.selected_object_idx >= len(self.blob_centers):
+            if self.selected_object_idx >= len(prompts_here):
                 self.selected_object_idx = None
 
         # Rebuild sidebar buttons (they will be re-numbered)
