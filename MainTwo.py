@@ -91,7 +91,6 @@ def process_image_and_scale_centers(img, downsample_resolution=8, min_area=1000,
     for blob_points in blob_centers:
         scaled_points = [(int(cx * downsample_resolution), int(cy * downsample_resolution)) for cx, cy in blob_points]
         scaled_blob_centers.append(scaled_points)
-
     return scaled_blob_centers
 
 # --- Worker Thread for Heavy SAM 2 Processing ---
@@ -99,8 +98,10 @@ class TrackerWorker(QThread):
     finished = pyqtSignal(str) # Emits the path to the mask folder
     progress = pyqtSignal(int) # Optional: to show progress if you added a bar
     error = pyqtSignal(str)
+    maskSaved = pyqtSignal(int, str) # Emits (frame_idx, mask_file_path) when mask is saved
+    centerlineComputed = pyqtSignal(int, dict) # Emits (frame_idx, {obj_id: centerline_points})
 
-    def __init__(self, video_path, device, scaled_blob_centers, colors=None, model_size='base', start_frame=0, end_frame=None, video_name=None):
+    def __init__(self, video_path, device, scaled_blob_centers, colors=None, model_size='base', start_frame=0, end_frame=None, video_name=None, num_centerline_points=100):
         super().__init__()
         self.save_mask_dir = "/Users/huayinluo/Documents/code/zhenlab/MultiscaleSEM/masks"
         self.video_path = video_path
@@ -110,11 +111,31 @@ class TrackerWorker(QThread):
         self.start_frame = int(start_frame) if start_frame is not None else 0
         self.end_frame = int(end_frame) if end_frame is not None else None
         self.video_name = video_name  # Store video_name (h5_file_path or video folder name)
+        self.num_centerline_points = int(num_centerline_points) if num_centerline_points is not None else 100
+        self._stop_requested = False
         # Colors can be passed in; if not, fall back to random colors
         if colors is None:
             self.colors = np.random.randint(0, 255, (100, 3), dtype=np.uint8)
         else:
             self.colors = colors # We need colors here now to bake them into the images
+
+    def request_stop(self):
+        """Request the worker to stop after the current iteration."""
+        self._stop_requested = True
+
+    def _interpolate_centerline(self, centerline, num_points):
+        """Select evenly spaced points from centerline."""
+        if len(centerline) <= 1:
+            return centerline
+        
+        # Select num_points evenly spaced points
+        N = len(centerline)
+        if N <= num_points:
+            return centerline
+        else:
+            indices = np.linspace(0, N-1, num_points, dtype=int)
+            resampled = [centerline[j] for j in indices]
+            return resampled
 
     def run(self):
         """
@@ -174,10 +195,17 @@ class TrackerWorker(QThread):
             ref_img = cv2.imread(first_frame_path)
             h, w = ref_img.shape[:2]
             
+            # Store centerlines: {frame_idx: {obj_id: [(x, y), ...]}}
+            all_centerlines = {}
+            
             for out_frame_idx, out_obj_ids, out_mask_logits in predictor.propagate_in_video(inference_state):
+                if self._stop_requested:
+                    break
                 save_frame_index = self.start_frame + out_frame_idx
                 # Create a black canvas for the color mask
                 color_mask = np.zeros((h, w, 3), dtype=np.uint8)
+                frame_centerlines = {}
+                
                 for i, out_obj_id in enumerate(out_obj_ids):
                     # Get binary mask for this object
                     mask = (out_mask_logits[i] > 0.0).cpu().numpy().squeeze()
@@ -192,12 +220,55 @@ class TrackerWorker(QThread):
                         
                         # Paint the color on the mask
                         color_mask[mask > 0] = color
+                        
+                        # Extract centerline (skeleton) from mask
+                        try:
+                            # Skeletonize the binary mask
+                            skeleton = skeletonize(mask.astype(bool))
+                            # Get skeleton points
+                            skeleton_coords = np.column_stack(np.where(skeleton))
+                            if len(skeleton_coords) > 0:
+                                # Convert from (y, x) to (x, y)
+                                full_centerline = [(int(pt[1]), int(pt[0])) for pt in skeleton_coords]
+                                # Resample to desired number of points
+                                resampled_centerline = full_centerline
+                                if len(full_centerline) > 1:
+                                    resampled_centerline = self._interpolate_centerline(full_centerline, self.num_centerline_points)
+                                # Store as tuple: (full_skeleton, resampled_points)
+                                frame_centerlines[out_obj_id] = (full_centerline, resampled_centerline)
+                        except Exception as e:
+                            print(f"Failed to compute centerline for object {out_obj_id} in frame {save_frame_index}: {e}")
+                            frame_centerlines[out_obj_id] = ([], [])
 
                 # Save the pre-colored mask to the new folder as a compressed JPG
                 # Only save if within requested start/end frame range
                 save_path = os.path.join(mask_output_dir, f"{save_frame_index}.jpg")
                 # Use reasonable JPEG quality to keep files small but good-looking
                 cv2.imwrite(save_path, color_mask, [int(cv2.IMWRITE_JPEG_QUALITY), 90])
+                
+                # Store centerlines for this frame
+                all_centerlines[save_frame_index] = frame_centerlines
+                
+                # Emit that mask was saved (so GUI can update its index and display)
+                try:
+                    self.maskSaved.emit(save_frame_index, save_path)
+                except Exception:
+                    pass
+                
+                # Emit centerlines for this frame
+                try:
+                    self.centerlineComputed.emit(save_frame_index, frame_centerlines)
+                except Exception:
+                    pass
+            
+            # Save all centerlines to numpy file
+            centerlines_path = os.path.join(mask_output_dir, "centerlines.npy")
+            try:
+                np.save(centerlines_path, all_centerlines)
+                print(f"Saved centerlines to {centerlines_path}")
+            except Exception as e:
+                print(f"Failed to save centerlines: {e}")
+            
             self.finished.emit(mask_output_dir)
 
         except Exception as e:
@@ -226,11 +297,12 @@ class ImageLoader(QThread):
         self._h5f = None
         self._h5_n_frames = None
 
-    def set_references(self, image_files=None, mask_files=None, h5_path=None, h5_dataset=None):
+    def set_references(self, image_files=None, mask_files=None, h5_path=None, h5_dataset=None, gui_instance=None):
         self.image_files = image_files
         self.mask_files = mask_files
         self.h5_path = h5_path
         self.h5_dataset = h5_dataset
+        self.gui_instance = gui_instance  # Reference to GUI for opacity value
         # reset per-thread HDF5 info; actual file handle will be opened inside run()
         self._h5_n_frames = None
         # if image_files given and it's a list, we keep it; otherwise None
@@ -347,9 +419,16 @@ class ImageLoader(QThread):
                         if mask_rgb.shape[:2] != img_rgb.shape[:2]:
                             mask_rgb = cv2.resize(mask_rgb, (img_rgb.shape[1], img_rgb.shape[0]), interpolation=cv2.INTER_NEAREST)
                         mask_indices = np.any(mask_rgb != [0, 0, 0], axis=-1)
+                        # Get opacity from GUI (default 0.5 if not available)
+                        opacity = 0.5
+                        if hasattr(self, 'gui_instance') and self.gui_instance is not None:
+                            try:
+                                opacity = self.gui_instance.mask_opacity
+                            except Exception:
+                                pass
                         # ensure copy before modifying
                         img_rgb = img_rgb.copy()
-                        img_rgb[mask_indices] = cv2.addWeighted(img_rgb[mask_indices], 0.5, mask_rgb[mask_indices], 0.5, 0)
+                        img_rgb[mask_indices] = cv2.addWeighted(img_rgb[mask_indices], 1.0 - opacity, mask_rgb[mask_indices], opacity, 0)
 
                 # emit the composed RGB image (numpy array)
                 self.frameLoaded.emit(idx, img_rgb)
@@ -411,8 +490,7 @@ class ExportH5Worker(QThread):
                 n_frames = self.end_frame - self.start_frame + 1
                 temp_dir = tempfile.mkdtemp(prefix='h5_frames_')
                 print(f"{self.start_frame}, {self.end_frame}")
-                # Note: cannot reference loop variable in tqdm desc before it's defined
-                for i in tqdm(range(self.start_frame, self.end_frame + 1), desc="Exporting frames from HDF5..."):
+                for i in tqdm(range(self.start_frame, self.end_frame + 1), desc=f"Exporting frames from HDF5..."):
                     try:
                         arr = np.asarray(ds[i])
                         if arr.ndim == 2:
@@ -609,6 +687,10 @@ class C_Elegans_GUI(QMainWindow):
         self.colors = np.random.randint(0, 255, (100, 3), dtype=np.uint8) # Pre-generate 100 random colors
         # Mapping from frame_idx -> mask file path (pre-colored JPGs)
         self.tracking_mask_files = {}
+        # Mapping from frame_idx -> {obj_id: [(x, y), ...]} centerline points
+        self.centerlines = {}
+        # Mask opacity (0.0 to 1.0, where 1.0 = fully opaque)
+        self.mask_opacity = 0.5
         # Simple in-memory cache for recently-used color masks to speed up display
         self._mask_cache = {}
         self._mask_cache_max = 64
@@ -651,7 +733,7 @@ class C_Elegans_GUI(QMainWindow):
         self._image_loader.frameLoaded.connect(self._on_frame_loaded)
         self._image_loader.start()
         # initial references (empty) - will be updated when folder selected / tracking finished
-        self._image_loader.set_references(self.image_files, self.tracking_mask_files)
+        self._image_loader.set_references(self.image_files, self.tracking_mask_files, gui_instance=self)
         # temp dir used when exporting HDF5 frames for tracking
         self._h5_export_tempdir = None
 
@@ -724,7 +806,7 @@ class C_Elegans_GUI(QMainWindow):
 
         # update image loader references and clear caches
         try:
-            self._image_loader.set_references(image_files=None, mask_files=self.tracking_mask_files, h5_path=self.h5_file_path, h5_dataset=self.h5_dataset_name)
+            self._image_loader.set_references(image_files=None, mask_files=self.tracking_mask_files, h5_path=self.h5_file_path, h5_dataset=self.h5_dataset_name, gui_instance=self)
         except Exception:
             pass
         self.clear_pixmap_cache()
@@ -876,7 +958,7 @@ class C_Elegans_GUI(QMainWindow):
         stream_row_layout.setContentsMargins(0, 0, 0, 0)
         stream_row_widget.setLayout(stream_row_layout)
         self.stream_mode_checkbox = QCheckBox("Stream Mode")
-        self.stream_mode_checkbox.setChecked(True)
+        self.stream_mode_checkbox.setChecked(False)
         stream_row_layout.addWidget(self.stream_mode_checkbox)
         stream_row_layout.addWidget(QLabel("Threshold:"))
         self.stream_threshold_spin = QSpinBox()
@@ -887,6 +969,34 @@ class C_Elegans_GUI(QMainWindow):
         stream_row_layout.addWidget(self.stream_threshold_spin)
         stream_row_layout.addStretch()
         self.left_layout.addWidget(stream_row_widget)
+
+        # Show centerlines checkbox
+        centerline_checkbox_widget = QWidget()
+        centerline_checkbox_layout = QHBoxLayout()
+        centerline_checkbox_layout.setContentsMargins(0, 0, 0, 0)
+        centerline_checkbox_widget.setLayout(centerline_checkbox_layout)
+        self.show_centerlines_checkbox = QCheckBox("Show Centerlines")
+        self.show_centerlines_checkbox.setChecked(True)
+        self.show_centerlines_checkbox.stateChanged.connect(self._on_show_centerlines_changed)
+        centerline_checkbox_layout.addWidget(self.show_centerlines_checkbox)
+        centerline_checkbox_layout.addStretch()
+        self.left_layout.addWidget(centerline_checkbox_widget)
+
+        # Centerline points row
+        centerline_row_widget = QWidget()
+        centerline_row_layout = QHBoxLayout()
+        centerline_row_layout.setContentsMargins(0, 0, 0, 0)
+        centerline_row_widget.setLayout(centerline_row_layout)
+        centerline_row_layout.addWidget(QLabel("Centerline Pts:"))
+        self.centerline_points_spin = QSpinBox()
+        self.centerline_points_spin.setMinimum(1)
+        self.centerline_points_spin.setMaximum(1000)
+        self.centerline_points_spin.setValue(100)
+        self.centerline_points_spin.setFixedWidth(60)
+        self.centerline_points_spin.valueChanged.connect(self._on_centerline_points_changed)
+        centerline_row_layout.addWidget(self.centerline_points_spin)
+        centerline_row_layout.addStretch()
+        self.left_layout.addWidget(centerline_row_widget)
 
 
         # Buttons
@@ -908,16 +1018,39 @@ class C_Elegans_GUI(QMainWindow):
         self.btn_pause_realtime.setEnabled(False)
         self.btn_pause_realtime.clicked.connect(self.toggle_realtime_pause)
 
+        self.btn_stop = QPushButton("Stop Tracking")
+        self.btn_stop.setEnabled(False)
+        self.btn_stop.clicked.connect(self.stop_tracking)
+
         # Move tracking buttons into left sidebar
         self.left_layout.addSpacing(10)
         self.left_layout.addWidget(self.btn_autosegment)
         self.left_layout.addWidget(self.btn_track)
         self.left_layout.addWidget(self.btn_track_realtime)
         self.left_layout.addWidget(self.btn_pause_realtime)
+        self.left_layout.addWidget(self.btn_stop)
+
+        # Create vertical opacity slider
+        opacity_slider_widget = QWidget()
+        opacity_slider_layout = QVBoxLayout()
+        opacity_slider_layout.setContentsMargins(0, 0, 0, 0)
+        opacity_slider_layout.addWidget(QLabel("Mask\nOpacity"), alignment=Qt.AlignHCenter)
+        self.mask_opacity_slider = QSlider(Qt.Vertical)
+        self.mask_opacity_slider.setMinimum(0)
+        self.mask_opacity_slider.setMaximum(100)
+        self.mask_opacity_slider.setValue(50)  # default 50%
+        self.mask_opacity_slider.setFixedWidth(40)
+        self.mask_opacity_slider.valueChanged.connect(self._on_mask_opacity_changed)
+        opacity_slider_layout.addWidget(self.mask_opacity_slider, stretch=1)
+        self.mask_opacity_label = QLabel("50%")
+        self.mask_opacity_label.setAlignment(Qt.AlignHCenter)
+        opacity_slider_layout.addWidget(self.mask_opacity_label)
+        opacity_slider_widget.setLayout(opacity_slider_layout)
 
         top_hlayout = QHBoxLayout()
         top_hlayout.addWidget(self.left_sidebar)
         top_hlayout.addWidget(self.image_label, stretch=1)
+        top_hlayout.addWidget(opacity_slider_widget)
         top_hlayout.addWidget(self.sidebar_area)
         layout.addLayout(top_hlayout)
 
@@ -1009,7 +1142,7 @@ class C_Elegans_GUI(QMainWindow):
             self.stacked_widget.setCurrentIndex(1)
             # update loader references and clear caches
             try:
-                self._image_loader.set_references(self.image_files, self.tracking_mask_files)
+                self._image_loader.set_references(self.image_files, self.tracking_mask_files, gui_instance=self)
             except Exception:
                 pass
             self.clear_pixmap_cache()
@@ -1048,6 +1181,66 @@ class C_Elegans_GUI(QMainWindow):
         """Handle direct input to frame spinbox to jump to that frame."""
         # Set slider value, which will trigger on_slider_change
         self.slider.setValue(value)
+
+    def _on_mask_opacity_changed(self, value):
+        """Handle mask opacity slider changes."""
+        self.mask_opacity = value / 100.0
+        self.mask_opacity_label.setText(f"{value}%")
+        # Clear pixmap cache so masks get redrawn with new opacity
+        self.clear_pixmap_cache()
+        # Request reload of current frame to show new opacity immediately
+        try:
+            self._image_loader.request(self.current_frame_idx)
+        except Exception:
+            pass
+
+    def _on_show_centerlines_changed(self, state):
+        """Handle show centerlines checkbox changes."""
+        # Clear pixmap cache so centerlines get redrawn/hidden
+        self.clear_pixmap_cache()
+        # Request reload of current frame
+        try:
+            self._image_loader.request(self.current_frame_idx)
+        except Exception:
+            pass
+
+    def _on_centerline_points_changed(self, value):
+        """Handle centerline points spinbox changes - resample and redraw."""
+        # Resample all existing centerlines to the new number of points
+        try:
+            for frame_idx in self.centerlines.keys():
+                frame_centerlines = self.centerlines[frame_idx]
+                updated_centerlines = {}
+                for obj_id, centerline_data in frame_centerlines.items():
+                    if isinstance(centerline_data, tuple) and len(centerline_data) == 2:
+                        full_skeleton, _ = centerline_data
+                        # Resample the full skeleton to the new number of points
+                        if len(full_skeleton) > 1:
+                            resampled = self._resample_centerline(full_skeleton, value)
+                        else:
+                            resampled = full_skeleton
+                        updated_centerlines[obj_id] = (full_skeleton, resampled)
+                    else:
+                        updated_centerlines[obj_id] = centerline_data
+                self.centerlines[frame_idx] = updated_centerlines
+            
+            # Clear cache and reload current frame
+            self.clear_pixmap_cache()
+            self._image_loader.request(self.current_frame_idx)
+        except Exception:
+            pass
+
+    def _resample_centerline(self, centerline, num_points):
+        """Resample centerline to desired number of points (same logic as TrackerWorker)."""
+        if len(centerline) <= 1:
+            return centerline
+        N = len(centerline)
+        if N <= num_points:
+            return centerline
+        else:
+            indices = np.round(np.linspace(0, N-1, num_points)).astype(int)
+            resampled = [centerline[j] for j in indices]
+            return resampled
 
     def clear_pixmap_cache(self):
         try:
@@ -1229,6 +1422,24 @@ class C_Elegans_GUI(QMainWindow):
         # normal folder-based tracking
         self._start_tracker_worker(self.video_path, start_frame=start_frame, end_frame=end_frame)
 
+    def stop_tracking(self):
+        """Request an early stop for ongoing tracking."""
+        try:
+            if hasattr(self, 'worker') and self.worker is not None and self.worker.isRunning():
+                self.worker.request_stop()
+                self.status_label.setText("Stop requested... finishing current frame.")
+            if hasattr(self, '_realtime_worker') and getattr(self, '_realtime_worker', None) is not None:
+                try:
+                    self._realtime_worker.stop()
+                except Exception:
+                    pass
+            try:
+                self.btn_stop.setEnabled(False)
+            except Exception:
+                pass
+        except Exception:
+            pass
+
     def run_tracking_realtime(self):
         """Start real-time tracking: export HDF5 if needed, otherwise start realtime worker on folder."""
         if not SAM2_AVAILABLE:
@@ -1254,7 +1465,7 @@ class C_Elegans_GUI(QMainWindow):
                 self.btn_autosegment.setEnabled(False)
                 self.status_label.setText("Exporting HDF5 frames to temporary folder for real-time tracking...")
                 self._export_worker = ExportH5Worker(self.h5_file_path, getattr(self, 'h5_dataset_name', None))
-                self._export_worker.stream_mode = True
+                self._export_worker.stream_mode = False
                 self._export_worker.progress.connect(lambda p: self.status_label.setText(f"Exporting frames... {p}%"))
                 self._export_worker.ready.connect(self._on_h5_export_finished_realtime)
                 self._export_worker.finished.connect(self.on_tracking_finished)
@@ -1310,6 +1521,10 @@ class C_Elegans_GUI(QMainWindow):
             self._realtime_worker.finished.connect(self.on_tracking_finished)
             self._realtime_worker.error.connect(self.on_tracking_error)
             self._realtime_worker.start()
+            try:
+                self.btn_stop.setEnabled(True)
+            except Exception:
+                pass
         except Exception as e:
             QMessageBox.critical(self, "Error", f"Failed to start realtime tracker: {e}")
             self.btn_track_realtime.setEnabled(True)
@@ -1335,10 +1550,16 @@ class C_Elegans_GUI(QMainWindow):
             print(f"Video name for tracker: {video_name}")
             print(f"trackerworker video folder: {video_folder}")
             print(f"trackerworker frame range: {start_frame} to {end_frame}")
-            self.worker = TrackerWorker(video_folder, self.device, prompts, colors=self.colors, model_size=getattr(self, 'model_size', 'base'), start_frame=start_frame, end_frame=end_frame, video_name=video_name)
+            self.worker = TrackerWorker(video_folder, self.device, prompts, colors=self.colors, model_size=getattr(self, 'model_size', 'base'), start_frame=start_frame, end_frame=end_frame, video_name=video_name, num_centerline_points=self.centerline_points_spin.value())
+            self.worker.maskSaved.connect(self._on_mask_saved)
+            self.worker.centerlineComputed.connect(self._on_centerline_computed)
             self.worker.finished.connect(self.on_tracking_finished)
             self.worker.error.connect(self.on_tracking_error)
             self.worker.start()
+            try:
+                self.btn_stop.setEnabled(True)
+            except Exception:
+                pass
         except Exception as e:
             QMessageBox.critical(self, "Error", f"Failed to start tracker: {e}")
             self.btn_track.setEnabled(True)
@@ -1412,6 +1633,41 @@ class C_Elegans_GUI(QMainWindow):
                     except Exception:
                         continue
                 # convert back to RGB for Qt
+                img_rgb = cv2.cvtColor(img_bgr, cv2.COLOR_BGR2RGB)
+                img_rgb = np.ascontiguousarray(img_rgb)
+                q_img = QImage(img_rgb.data, w, h, bytes_per_line, QImage.Format_RGB888)
+            
+            # Draw centerlines if available for this frame and checkbox is checked
+            show_centerlines = getattr(self, 'show_centerlines_checkbox', None)
+            if idx in self.centerlines and show_centerlines and show_centerlines.isChecked():
+                # Convert back to BGR for OpenCV drawing
+                img_bgr = cv2.cvtColor(img_rgb, cv2.COLOR_RGB2BGR)
+                centerline_dict = self.centerlines[idx]
+                pink_bgr = (255, 192, 203)  # Pink in BGR
+                red_bgr = (0, 0, 255)  # Red in BGR
+                for obj_id, centerline_data in centerline_dict.items():
+                    # centerline_data is (full_skeleton, resampled_points)
+                    if isinstance(centerline_data, tuple) and len(centerline_data) == 2:
+                        full_skeleton, resampled_points = centerline_data
+                    else:
+                        # Backward compatibility: if it's just a list, treat as resampled
+                        full_skeleton = centerline_data if centerline_data else []
+                        resampled_points = centerline_data if centerline_data else []
+                    
+                    # Draw full skeleton as pink circles (small)
+                    for pt in full_skeleton:
+                        try:
+                            cv2.circle(img_bgr, pt, 1, pink_bgr, -1)
+                        except Exception:
+                            pass
+                    
+                    # Draw resampled points as red circles (larger)
+                    for pt in resampled_points:
+                        try:
+                            cv2.circle(img_bgr, pt, 3, red_bgr, -1)
+                        except Exception:
+                            pass
+                # Convert back to RGB
                 img_rgb = cv2.cvtColor(img_bgr, cv2.COLOR_BGR2RGB)
                 img_rgb = np.ascontiguousarray(img_rgb)
                 q_img = QImage(img_rgb.data, w, h, bytes_per_line, QImage.Format_RGB888)
@@ -1498,6 +1754,47 @@ class C_Elegans_GUI(QMainWindow):
             # pass other keys to base class
             super().keyPressEvent(event)
 
+    def _on_mask_saved(self, frame_idx, mask_path):
+        """Called when a single mask is saved during tracking.
+        Update mask index and display if on that frame.
+        """
+        try:
+            # Add to mask index
+            self.tracking_mask_files[frame_idx] = mask_path
+            # Clear cached mask for this frame
+            self._mask_cache.pop(frame_idx, None)
+            # Clear cached pixmap for this frame so it reloads with mask
+            self.pixmap_cache.pop(frame_idx, None)
+            
+            # Update image loader references
+            self._image_loader.set_references(
+                image_files=self.image_files, 
+                mask_files=self.tracking_mask_files, 
+                h5_path=getattr(self, 'h5_file_path', None), 
+                h5_dataset=getattr(self, 'h5_dataset_name', None),
+                gui_instance=self
+            )
+            
+            # Navigate to this frame and display the new mask
+            self.slider.setValue(frame_idx)
+        except Exception:
+            pass
+    
+    def _on_centerline_computed(self, frame_idx, centerline_dict):
+        """Called when centerlines are computed for a frame.
+        Store centerlines and trigger redraw if viewing this frame.
+        """
+        try:
+            # Store centerlines for this frame
+            self.centerlines[frame_idx] = centerline_dict
+            # Clear cached pixmap so centerlines get drawn
+            self.pixmap_cache.pop(frame_idx, None)
+            # If viewing this frame, request reload to draw centerlines
+            if frame_idx == self.current_frame_idx:
+                self._image_loader.request(frame_idx)
+        except Exception:
+            pass
+
     def on_tracking_finished(self, results):
         """`results` is the mask output folder path emitted by the worker.
         Build an index of available mask JPGs and prepare cache structures for fast loading.
@@ -1526,7 +1823,7 @@ class C_Elegans_GUI(QMainWindow):
 
         # update image loader references to include mask files
         try:
-            self._image_loader.set_references(image_files=self.image_files, mask_files=self.tracking_mask_files, h5_path=getattr(self, 'h5_file_path', None), h5_dataset=getattr(self, 'h5_dataset_name', None))
+            self._image_loader.set_references(image_files=self.image_files, mask_files=self.tracking_mask_files, h5_path=getattr(self, 'h5_file_path', None), h5_dataset=getattr(self, 'h5_dataset_name', None), gui_instance=self)
         except Exception:
             pass
 
@@ -1535,6 +1832,10 @@ class C_Elegans_GUI(QMainWindow):
         self.status_label.setText("Tracking Complete.")
         self.btn_track.setEnabled(True)
         self.btn_autosegment.setEnabled(True)
+        try:
+            self.btn_stop.setEnabled(False)
+        except Exception:
+            pass
         # Clear any cached scaled pixmaps (they were created without masks)
         try:
             self.pixmap_cache.clear()
@@ -1588,7 +1889,9 @@ class C_Elegans_GUI(QMainWindow):
                 mask = cv2.resize(mask, (img.shape[1], img.shape[0]), interpolation=cv2.INTER_NEAREST)
             mask_indices = np.any(mask != [0, 0, 0], axis=-1)
             composed = img.copy()
-            composed[mask_indices] = cv2.addWeighted(composed[mask_indices], 0.5, mask[mask_indices], 0.5, 0)
+            # Use dynamic opacity from slider
+            opacity = getattr(self, 'mask_opacity', 0.5)
+            composed[mask_indices] = cv2.addWeighted(composed[mask_indices], 1.0 - opacity, mask[mask_indices], opacity, 0)
 
             # convert to RGB and display
             img_rgb = cv2.cvtColor(composed, cv2.COLOR_BGR2RGB)
@@ -1899,6 +2202,10 @@ class C_Elegans_GUI(QMainWindow):
         self.status_label.setText("Tracking Failed.")
         self.btn_track.setEnabled(True)
         self.btn_autosegment.setEnabled(True)
+        try:
+            self.btn_stop.setEnabled(False)
+        except Exception:
+            pass
 
     def _on_h5_export_finished(self, temp_folder):
         """Called when ExportH5Worker finishes exporting frames to `temp_folder`."""
