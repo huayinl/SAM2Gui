@@ -1,0 +1,27 @@
+# Deep Learning & Models
+torch
+torchvision
+transformers
+huggingface-hub
+segment-anything
+SAM-2 @ git+https://github.com/facebookresearch/segment-anything-2.git@c2ec8e1
+
+# Computer Vision & Image Processing
+opencv-python
+scikit-image
+pillow
+tifffile
+nd2reader
+
+# Data Science & Math
+numpy
+pandas
+scipy
+matplotlib
+
+# Utilities & Config
+hydra-core
+omegaconf
+tqdm
+wandb
+pydantic
