@@ -1,5 +1,8 @@
 import sys
 import os
+
+# Set MPS memory limit before importing torch
+os.environ.setdefault("PYTORCH_MPS_HIGH_WATERMARK_RATIO", "0.0")
 import cv2
 import numpy as np
 import torch
@@ -8,17 +11,8 @@ import tempfile
 import shutil
 from datetime import datetime
 from tqdm import tqdm
-try:
-    from PIL import Image
-    PIL_AVAILABLE = True
-except Exception:
-    PIL_AVAILABLE = False
-try:
-    import h5py
-    H5PY_AVAILABLE = True
-except Exception:
-    h5py = None
-    H5PY_AVAILABLE = False
+from PIL import Image
+import h5py
 from PyQt5.QtWidgets import (QApplication, QMainWindow, QWidget, QVBoxLayout, 
                              QHBoxLayout, QPushButton, QLabel, QFileDialog, 
                              QStackedWidget, QSlider, QMessageBox, QProgressBar, QComboBox, QScrollArea, QSpinBox, QCheckBox)
@@ -115,6 +109,7 @@ class TrackerWorker(QThread):
         self.video_name = video_name  # Store video_name (h5_file_path or video folder name)
         self.num_centerline_points = int(num_centerline_points) if num_centerline_points is not None else 100
         self._stop_requested = False
+        self.chunk_size = 500  # Process 500 frames at a time to avoid OOM
         # Colors can be passed in; if not, fall back to random colors
         if colors is None:
             self.colors = np.random.randint(0, 255, (100, 3), dtype=np.uint8)
@@ -140,20 +135,51 @@ class TrackerWorker(QThread):
             return resampled
 
     def run(self):
-        """
-        Given a temporary video folder path, runs SAM 2 tracking with the provided prompts.
-        (this temporary video folder is just the selected frames exported from the HDF5 file)
-        """
+        """Run tracking in chunks to avoid OOM errors."""
         try:
-            # 1. Setup Folders
-            video_dir_name = os.path.basename(os.path.normpath(self.video_path))
-            parent_dir = os.path.dirname(os.path.normpath(self.video_path))
+            # Setup output directory
             ts = datetime.now().strftime("%Y%m%d_%H%M%S")
             mask_output_dir = os.path.join(self.save_mask_dir, f"{self.video_name}_masks_{ts}")
             os.makedirs(mask_output_dir, exist_ok=True)
             print(f"Initialized mask output directory at: {mask_output_dir}")
 
-            # 2. Initialize Model based on selected model_size
+            # Get total frame count
+            frame_files = sorted([f for f in os.listdir(self.video_path) if f.lower().endswith(('.jpg', '.jpeg', '.png'))])
+            total_frames = len(frame_files)
+            
+            # Determine actual end frame
+            actual_end_frame = self.end_frame if self.end_frame is not None else total_frames - 1
+            
+            # Create a temporary folder with symlinks/hardlinks to ONLY the frames we want to track
+            tracking_temp_dir = tempfile.mkdtemp(prefix="sam2_tracking_")
+            try:
+                for i in range(self.start_frame, actual_end_frame + 1):
+                    src_frame = os.path.join(self.video_path, frame_files[i])
+                    dst_frame = os.path.join(tracking_temp_dir, f"{i:06d}.jpg")
+                    
+                    # Try symlink first (fastest, cross-platform)
+                    try:
+                        os.symlink(src_frame, dst_frame)
+                    except (OSError, NotImplementedError):
+                        # Windows without admin or different filesystem
+                        # Try hard link (works on same drive, faster than copy)
+                        try:
+                            os.link(src_frame, dst_frame)
+                        except (OSError, NotImplementedError):
+                            # Different drives or filesystem doesn't support hard links
+                            # Last resort: copy (slower but always works)
+                            shutil.copy2(src_frame, dst_frame)
+                print(f"Created tracking subset with frames {self.start_frame} to {actual_end_frame}")
+            except Exception as e:
+                print(f"Error creating tracking subset: {e}")
+                shutil.rmtree(tracking_temp_dir)
+                raise e
+
+
+            # Initialize centerlines storage
+            all_centerlines = {}
+            
+            # Initialize SAM2 predictor ONCE before all chunks (this loads video frames once)
             model_size = getattr(self, 'model_size', 'base')
             if model_size == 'tiny':
                 sam2_checkpoint = "./checkpoints/sam2.1_hiera_tiny.pt"
@@ -167,107 +193,84 @@ class TrackerWorker(QThread):
             else:
                 self.error.emit(f"Unknown model size: {model_size}")
                 return
+
             if not os.path.exists(sam2_checkpoint):
                 self.error.emit(f"Checkpoint not found: {sam2_checkpoint}")
                 return
 
-            
+            print(f"Initializing SAM2 predictor with checkpoint: {sam2_checkpoint}")
             predictor = build_sam2_video_predictor(model_cfg, sam2_checkpoint, device=self.device)
-            inference_state = predictor.init_state(video_path=self.video_path)
-            print(f"Initialized inference state w video path: {self.video_path}")
+            inference_state = predictor.init_state(video_path=tracking_temp_dir)
+            print(f"Predictor initialized for video with {total_frames} total frames")
             
-            # 3. Add Prompts
-            for i, prompts in enumerate(self.scaled_blob_centers):
-                if not prompts:
-                    continue
-                ann_obj_id = i + 1
-                # prompts is a list of ((x, y), label) tuples
-                points = np.array([pt for pt, _ in prompts], dtype=np.float32)
-                labels = np.array([lbl for _, lbl in prompts], dtype=np.int32)
-                predictor.add_new_points_or_box(
-                    inference_state=inference_state,
-                    frame_idx=0, # 0 in the temporary folder
-                    obj_id=ann_obj_id,
-                    points=points,
-                    labels=labels,
+            # Initial prompts for first chunk
+            current_prompts = self.scaled_blob_centers
+            
+            # Process in chunks
+            chunk_start = self.start_frame
+            while chunk_start <= actual_end_frame and not self._stop_requested:
+                chunk_end = min(chunk_start + self.chunk_size - 1, actual_end_frame)
+                print(f"\n=== Processing chunk: frames {chunk_start} to {chunk_end} ===")
+                
+                # Track this chunk (pass predictor and inference_state)
+                chunk_centerlines = self._track_chunk(
+                    predictor,
+                    inference_state,
+                    chunk_start, 
+                    chunk_end, 
+                    current_prompts, 
+                    mask_output_dir
                 )
-
-            # 4. Propagate and Save to Disk Immediately
-            print(f"Propagating and saving masks to {mask_output_dir}...")
-            
-            # Get image dimensions from the first frame to ensure mask matches
-            first_frame_path = os.path.join(self.video_path, sorted(os.listdir(self.video_path))[0])
-            ref_img = cv2.imread(first_frame_path)
-            h, w = ref_img.shape[:2]
-            
-            # Store centerlines: {frame_idx: {obj_id: [(x, y), ...]}}
-            all_centerlines = {}
-            
-            for out_frame_idx, out_obj_ids, out_mask_logits in predictor.propagate_in_video(inference_state):
-                if self._stop_requested:
-                    break
-                save_frame_index = self.start_frame + out_frame_idx
-                # Create a black canvas for the color mask
-                color_mask = np.zeros((h, w, 3), dtype=np.uint8)
-                frame_centerlines = {}
                 
-                for i, out_obj_id in enumerate(out_obj_ids):
-                    # Get binary mask for this object
-                    mask = (out_mask_logits[i] > 0.0).cpu().numpy().squeeze()
+                # Merge centerlines
+                all_centerlines.update(chunk_centerlines)
+                
+                # If there's another chunk, prepare prompts from last frame's centerlines
+                if chunk_end < actual_end_frame and not self._stop_requested:
+                    print(f"Preparing prompts for next chunk from frame {chunk_end}")
+                    current_prompts = self._centerlines_to_prompts(chunk_centerlines.get(chunk_end, {}))
                     
-                    if mask.sum() > 0:
-                        # Resize if necessary (SAM output safety)
-                        if mask.shape != (h, w):
-                            mask = cv2.resize(mask.astype(np.uint8), (w, h), interpolation=cv2.INTER_NEAREST)
-                        
-                        # Get color for this object using SAM object ID
-                        # out_obj_id is 1, 2, 3... for GUI objects 0, 1, 2...
-                        color = self.colors[out_obj_id % len(self.colors)]
-                        
-                        # Paint the color on the mask
-                        color_mask[mask > 0] = color
-                        
-                        # Extract centerline (skeleton) from mask
+                    if not current_prompts or all(len(p) == 0 for p in current_prompts):
+                        print(f"Warning: No centerlines found in frame {chunk_end}, stopping tracking.")
+                        break
+                    
+                    # Cleanup before next chunk
+                    import gc
+                    gc.collect()
+                    if self.device.type == "mps":
                         try:
-                            # Skeletonize the binary mask
-                            skeleton = skeletonize(mask.astype(bool))
-                            # Get skeleton points
-                            skeleton_coords = np.column_stack(np.where(skeleton))
-                            if len(skeleton_coords) > 0:
-                                # Convert from (y, x) to (x, y)
-                                full_centerline = [(int(pt[1]), int(pt[0])) for pt in skeleton_coords]
-                                # Resample to desired number of points
-                                resampled_centerline = full_centerline
-                                if len(full_centerline) > 1:
-                                    resampled_centerline = self._interpolate_centerline(full_centerline, self.num_centerline_points)
-                                # Store as tuple: (full_skeleton, resampled_points)
-                                frame_centerlines[out_obj_id] = (full_centerline, resampled_centerline)
-                        except Exception as e:
-                            print(f"Failed to compute centerline for object {out_obj_id} in frame {save_frame_index}: {e}")
-                            frame_centerlines[out_obj_id] = ([], [])
-
-                # Save the pre-colored mask to the new folder as PNG
-                # Only save if within requested start/end frame range
-                save_path = os.path.join(mask_output_dir, f"{save_frame_index}.png")
-                # Use PNG compression level 9 for best compression
-                cv2.imwrite(save_path, color_mask, [int(cv2.IMWRITE_PNG_COMPRESSION), 9])
+                            torch.mps.empty_cache()
+                        except Exception:
+                            pass
+                    elif self.device.type == "cuda":
+                        try:
+                            torch.cuda.empty_cache()
+                        except Exception:
+                            pass
                 
-                # Store centerlines for this frame
-                all_centerlines[save_frame_index] = frame_centerlines
-                
-                # Emit that mask was saved (so GUI can update its index and display)
+                # Move to next chunk
+                chunk_start = chunk_end + 1
+            
+            # Cleanup after all chunks
+            try:
+                del predictor
+                del inference_state
+            except Exception:
+                pass
+            import gc
+            gc.collect()
+            if self.device.type == "mps":
                 try:
-                    self.maskSaved.emit(save_frame_index, save_path)
+                    torch.mps.empty_cache()
                 except Exception:
                     pass
-                
-                # Emit centerlines for this frame
+            elif self.device.type == "cuda":
                 try:
-                    self.centerlineComputed.emit(save_frame_index, frame_centerlines)
+                    torch.cuda.empty_cache()
                 except Exception:
                     pass
             
-            # Save all centerlines to numpy file
+            # Save all centerlines
             centerlines_path = os.path.join(mask_output_dir, "centerlines.npy")
             try:
                 np.save(centerlines_path, all_centerlines)
@@ -280,7 +283,142 @@ class TrackerWorker(QThread):
         except Exception as e:
             import traceback
             traceback.print_exc()
-            self.error.emit(str(e))# --- GUI Components ---
+            self.error.emit(str(e))
+
+    def _track_chunk(self, predictor, inference_state, chunk_start, chunk_end, prompts, mask_output_dir):
+        """Track a single chunk of frames using pre-initialized predictor and inference_state."""
+        chunk_centerlines = {}
+        
+        # Add prompts at chunk_start frame
+        for i, obj_prompts in enumerate(prompts):
+            if not obj_prompts:
+                continue
+            ann_obj_id = i + 1
+            points = np.array([pt for pt, _ in obj_prompts], dtype=np.float32)
+            labels = np.array([lbl for _, lbl in obj_prompts], dtype=np.int32)
+            predictor.add_new_points_or_box(
+                inference_state=inference_state,
+                frame_idx=chunk_start,
+                obj_id=ann_obj_id,
+                points=points,
+                labels=labels,
+            )
+
+        # Get reference image dimensions
+        frame_files = sorted([f for f in os.listdir(self.video_path) if f.lower().endswith(('.jpg', '.jpeg', '.png'))])
+        first_frame_path = os.path.join(self.video_path, frame_files[chunk_start])
+        ref_img = cv2.imread(first_frame_path)
+        h, w = ref_img.shape[:2]
+
+        # Propagate with memory management
+        with torch.inference_mode():
+            for out_frame_idx, out_obj_ids, out_mask_logits in predictor.propagate_in_video(inference_state):
+                if self._stop_requested:
+                    break
+                
+                save_frame_index = chunk_start + out_frame_idx
+                
+                # Stop if beyond chunk end
+                if save_frame_index > chunk_end:
+                    break
+
+                # Create color mask
+                color_mask = np.zeros((h, w, 3), dtype=np.uint8)
+                frame_centerlines = {}
+
+                for i, out_obj_id in enumerate(out_obj_ids):
+                    mask = (out_mask_logits[i] > 0.0).cpu().numpy().squeeze()
+                    
+                    if mask.sum() > 0:
+                        if mask.shape != (h, w):
+                            mask = cv2.resize(mask.astype(np.uint8), (w, h), interpolation=cv2.INTER_NEAREST)
+                        
+                        color = self.colors[out_obj_id % len(self.colors)]
+                        color_mask[mask > 0] = color
+                        
+                        # Extract centerline
+                        try:
+                            skeleton = skeletonize(mask.astype(bool))
+                            skeleton_coords = np.column_stack(np.where(skeleton))
+                            if len(skeleton_coords) > 0:
+                                full_centerline = [(int(pt[1]), int(pt[0])) for pt in skeleton_coords]
+                                resampled_centerline = full_centerline
+                                if len(full_centerline) > 1:
+                                    resampled_centerline = self._interpolate_centerline(full_centerline, self.num_centerline_points)
+                                frame_centerlines[out_obj_id] = (full_centerline, resampled_centerline)
+                        except Exception as e:
+                            print(f"Failed to compute centerline for object {out_obj_id} in frame {save_frame_index}: {e}")
+                            frame_centerlines[out_obj_id] = ([], [])
+
+                # Save mask
+                save_path = os.path.join(mask_output_dir, f"{save_frame_index}.png")
+                cv2.imwrite(save_path, color_mask, [int(cv2.IMWRITE_PNG_COMPRESSION), 9])
+                
+                # Store centerlines
+                chunk_centerlines[save_frame_index] = frame_centerlines
+                
+                # Emit signals
+                try:
+                    self.maskSaved.emit(save_frame_index, save_path)
+                    self.centerlineComputed.emit(save_frame_index, frame_centerlines)
+                except Exception:
+                    pass
+                
+                # Clean up tensors
+                try:
+                    del out_mask_logits
+                except Exception:
+                    pass
+                
+                # Clear cache periodically
+                if save_frame_index % 50 == 0:
+                    if self.device.type == "mps":
+                        try:
+                            torch.mps.empty_cache()
+                        except Exception:
+                            pass
+                    elif self.device.type == "cuda":
+                        try:
+                            torch.cuda.empty_cache()
+                        except Exception:
+                            pass
+
+        # Don't cleanup predictor/inference_state here - they're reused across chunks
+        # Only do lightweight cache clearing
+        import gc
+        gc.collect()
+        if self.device.type == "mps":
+            try:
+                torch.mps.empty_cache()
+            except Exception:
+                pass
+        elif self.device.type == "cuda":
+            try:
+                torch.cuda.empty_cache()
+            except Exception:
+                pass
+        
+        return chunk_centerlines
+
+    def _centerlines_to_prompts(self, centerline_dict):
+        """Convert centerlines from last frame to prompts for next chunk."""
+        prompts = []
+        
+        # Get all object IDs (sorted to maintain order)
+        obj_ids = sorted(centerline_dict.keys())
+        
+        for obj_id in obj_ids:
+            centerline_data = centerline_dict.get(obj_id, ([], []))
+            if isinstance(centerline_data, tuple) and len(centerline_data) == 2:
+                _, resampled_points = centerline_data
+            else:
+                resampled_points = centerline_data if centerline_data else []
+            
+            # Convert resampled centerline points to positive prompts
+            obj_prompts = [((x, y), 1) for x, y in resampled_points]
+            prompts.append(obj_prompts)
+        
+        return prompts# --- GUI Components ---
 
 class ImageLoader(QThread):
     """Background loader that reads frames and (optionally) pre-colored masks,
@@ -321,26 +459,6 @@ class ImageLoader(QThread):
                 self._req_q.put(idx)
             except Exception:
                 pass
-                try:
-                    if hasattr(self, '_realtime_worker') and getattr(self, '_realtime_worker') is not None:
-                        if getattr(self._realtime_worker, '_paused', False):
-                            # resume
-                            try:
-                                self._realtime_worker.resume()
-                                self.btn_pause_realtime.setText("Pause Tracking")
-                                self.status_label.setText("Real-time tracking: resumed")
-                            except Exception:
-                                pass
-                        else:
-                            # pause
-                            try:
-                                self._realtime_worker.pause()
-                                self.btn_pause_realtime.setText("Resume Tracking")
-                                self.status_label.setText("Real-time tracking: paused")
-                            except Exception:
-                                pass
-                except Exception:
-                    pass
 
     def run(self):
         while self._running:
@@ -358,8 +476,6 @@ class ImageLoader(QThread):
 
                 # If using HDF5, ensure we have dataset length and an open handle
                 if self.h5_path is not None:
-                    if not H5PY_AVAILABLE:
-                        continue
                     # open HDF5 file once in this thread for efficiency
                     if self._h5f is None:
                         try:
@@ -470,9 +586,6 @@ class ExportH5Worker(QThread):
         print(f"Initialized ExportH5Worker with start_frame={start_frame}, end_frame={end_frame}, dataset_name={dataset_name}")
 
     def run(self):
-        if not H5PY_AVAILABLE:
-            self.error.emit("h5py not available")
-            return
         try:
             with h5py.File(self.h5_path, 'r') as f:
                 ds_name = self.dataset_name
@@ -543,132 +656,6 @@ class ExportH5Worker(QThread):
                         # skip problematic frames
                         continue
             self.finished.emit(temp_dir)
-        except Exception as e:
-            import traceback
-            traceback.print_exc()
-            self.error.emit(str(e))
-
-class RealTimeTrackerWorker(QThread):
-    """Tracker that emits masks per-frame so GUI can display them in real time.
-    Signals:
-      frameMask(int, np.ndarray): emits (frame_idx, color_mask_bgr)
-      finished(str): emits mask folder path when done
-      error(str)
-    Supports pause()/resume()/stop().
-    """
-    frameMask = pyqtSignal(int, object)
-    finished = pyqtSignal(str)
-    error = pyqtSignal(str)
-
-    def __init__(self, video_path, device, scaled_blob_centers, colors=None, model_size='base', start_frame=0, end_frame=None):
-        super().__init__()
-        self.video_path = video_path
-        self.device = device
-        self.scaled_blob_centers = scaled_blob_centers
-        self.model_size = model_size
-        self._running = True
-        self._paused = False
-        self.start_frame = int(start_frame) if start_frame is not None else 0
-        self.end_frame = int(end_frame) if end_frame is not None else None
-        if colors is None:
-            self.colors = np.random.randint(0, 255, (100, 3), dtype=np.uint8)
-        else:
-            self.colors = colors
-
-    def pause(self):
-        self._paused = True
-
-    def resume(self):
-        self._paused = False
-
-    def stop(self):
-        self._running = False
-
-    def run(self):
-        try:
-            # similar init to TrackerWorker
-            video_dir_name = os.path.basename(os.path.normpath(self.video_path))
-            parent_dir = os.path.dirname(os.path.normpath(self.video_path))
-            mask_output_dir = os.path.join(parent_dir, f"{video_dir_name}_masks")
-            os.makedirs(mask_output_dir, exist_ok=True)
-
-            model_size = getattr(self, 'model_size', 'base')
-            if model_size == 'tiny':
-                sam2_checkpoint = "./checkpoints/sam2.1_hiera_tiny.pt"
-                model_cfg = "configs/sam2.1/sam2.1_hiera_t.yaml"
-            elif model_size == 'base':
-                sam2_checkpoint = "./checkpoints/sam2.1_hiera_base_plus.pt"
-                model_cfg = "configs/sam2.1/sam2.1_hiera_b+.yaml"
-            elif model_size == 'large':
-                sam2_checkpoint = "./checkpoints/sam2.1_hiera_large.pt"
-                model_cfg = "configs/sam2.1/sam2.1_hiera_l.yaml"
-            else:
-                self.error.emit(f"Unknown model size: {model_size}")
-                return
-
-            if not os.path.exists(sam2_checkpoint):
-                self.error.emit(f"Checkpoint not found: {sam2_checkpoint}")
-                return
-
-            # initialize predictor with video path
-            predictor = build_sam2_video_predictor(model_cfg, sam2_checkpoint, device=self.device)
-            inference_state = predictor.init_state(video_path=self.video_path)
-            for i, prompts in enumerate(self.scaled_blob_centers):
-                if not prompts:
-                    continue
-                ann_obj_id = i + 1
-                # prompts is a list of ((x, y), label) tuples
-                points = np.array([pt for pt, _ in prompts], dtype=np.float32)
-                labels = np.array([lbl for _, lbl in prompts], dtype=np.int32)
-                predictor.add_new_points_or_box(
-                    inference_state=inference_state,
-                    frame_idx=0,
-                    obj_id=ann_obj_id,
-                    points=points,
-                    labels=labels,
-                )
-            first_frame_path = os.path.join(self.video_path, sorted(os.listdir(self.video_path))[0])
-            ref_img = cv2.imread(first_frame_path)
-            h, w = ref_img.shape[:2]
-
-            for out_frame_idx, out_obj_ids, out_mask_logits in predictor.propagate_in_video(inference_state):
-                if not self._running:
-                    break
-                # respect pause
-                while self._paused and self._running:
-                    QThread.msleep(100)
-
-                # assemble color mask
-                color_mask = np.zeros((h, w, 3), dtype=np.uint8)
-                for i, out_obj_id in enumerate(out_obj_ids):
-                    mask = (out_mask_logits[i] > 0.0).cpu().numpy().squeeze()
-                    if mask.sum() > 0:
-                        if mask.shape != (h, w):
-                            mask = cv2.resize(mask.astype(np.uint8), (w, h), interpolation=cv2.INTER_NEAREST)
-                        # Get color for this object using SAM object ID
-                        # out_obj_id is 1, 2, 3... for GUI objects 0, 1, 2...
-                        color = self.colors[out_obj_id % len(self.colors)]
-                        color_mask[mask > 0] = color
-
-                # emit for GUI to display (only if within range)
-                if out_frame_idx >= self.start_frame and (self.end_frame is None or out_frame_idx <= self.end_frame):
-                    try:
-                        self.frameMask.emit(out_frame_idx, color_mask.copy())
-                    except Exception:
-                        pass
-                    # save mask
-                    save_path = os.path.join(mask_output_dir, f"{out_frame_idx}.png")
-                    try:
-                        cv2.imwrite(save_path, color_mask, [int(cv2.IMWRITE_PNG_COMPRESSION), 9])
-                    except Exception:
-                        pass
-
-                # stop early if we've passed end_frame
-                if self.end_frame is not None and out_frame_idx > self.end_frame:
-                    break
-
-            # finished
-            self.finished.emit(mask_output_dir)
         except Exception as e:
             import traceback
             traceback.print_exc()
@@ -779,9 +766,6 @@ class C_Elegans_GUI(QMainWindow):
         self.stacked_widget.addWidget(self.selection_widget)
 
     def choose_hdf5(self):
-        if not H5PY_AVAILABLE:
-            QMessageBox.critical(self, "Error", "h5py is not installed. Please install h5py to import HDF5 files.")
-            return
         path, _ = QFileDialog.getOpenFileName(self, "Select HDF5 file", filter="HDF5 Files (*.h5 *.hdf5);;All Files (*)")
         if not path:
             return
@@ -795,8 +779,8 @@ class C_Elegans_GUI(QMainWindow):
                     if pref in f:
                         ds_name = pref
                         break
+                # pick first dataset
                 if ds_name is None:
-                    # pick first dataset
                     for k in f.keys():
                         if isinstance(f[k], h5py.Dataset):
                             ds_name = k
@@ -855,16 +839,12 @@ class C_Elegans_GUI(QMainWindow):
 
     def choose_tif(self):
         """Import a TIF/TIFF video file (multi-frame TIFF stack)."""
-        if not PIL_AVAILABLE:
-            QMessageBox.critical(self, "Error", "Pillow (PIL) is not installed. Please install it to import TIF files.")
-            return
-        
         path, _ = QFileDialog.getOpenFileName(self, "Select TIF/TIFF file", filter="TIF Files (*.tif *.tiff);;All Files (*)")
         if not path:
             return
 
+        # Open the TIFF file to check how many frames it has
         try:
-            # Open the TIFF file to check how many frames it has
             with Image.open(path) as img:
                 n_frames = getattr(img, 'n_frames', 1)
             
@@ -1133,15 +1113,6 @@ class C_Elegans_GUI(QMainWindow):
         self.btn_track.clicked.connect(self.run_tracking)
         self.btn_track.setEnabled(False) # Disabled until autosegment is done
 
-        # Real-time tracking buttons
-        self.btn_track_realtime = QPushButton("Track in Real Time")
-        self.btn_track_realtime.clicked.connect(self.run_tracking_realtime)
-        self.btn_track_realtime.setEnabled(False)
-
-        self.btn_pause_realtime = QPushButton("Pause Tracking")
-        self.btn_pause_realtime.setEnabled(False)
-        self.btn_pause_realtime.clicked.connect(self.toggle_realtime_pause)
-
         self.btn_stop = QPushButton("Stop Tracking")
         self.btn_stop.setEnabled(False)
         self.btn_stop.clicked.connect(self.stop_tracking)
@@ -1150,8 +1121,6 @@ class C_Elegans_GUI(QMainWindow):
         self.left_layout.addSpacing(10)
         self.left_layout.addWidget(self.btn_autosegment)
         self.left_layout.addWidget(self.btn_track)
-        self.left_layout.addWidget(self.btn_track_realtime)
-        self.left_layout.addWidget(self.btn_pause_realtime)
         self.left_layout.addWidget(self.btn_stop)
 
         # Create vertical opacity slider
@@ -1218,13 +1187,6 @@ class C_Elegans_GUI(QMainWindow):
         controls_layout.addWidget(self.model_combo)
 
         layout.addLayout(controls_layout)
-
-        # btn_layout.addWidget(self.btn_autosegment)
-        # btn_layout.addWidget(self.btn_track)
-        # btn_layout.addWidget(self.btn_track_realtime)
-        # btn_layout.addWidget(self.btn_pause_realtime)
-        # layout.addLayout(btn_layout)
-
         # Status Bar / Progress
         self.status_label = QLabel("Ready")
         layout.addWidget(self.status_label)
@@ -1600,108 +1562,12 @@ class C_Elegans_GUI(QMainWindow):
             if hasattr(self, 'worker') and self.worker is not None and self.worker.isRunning():
                 self.worker.request_stop()
                 self.status_label.setText("Stop requested... finishing current frame.")
-            if hasattr(self, '_realtime_worker') and getattr(self, '_realtime_worker', None) is not None:
-                try:
-                    self._realtime_worker.stop()
-                except Exception:
-                    pass
             try:
                 self.btn_stop.setEnabled(False)
             except Exception:
                 pass
         except Exception:
             pass
-
-    def run_tracking_realtime(self):
-        """Start real-time tracking: export HDF5 if needed, otherwise start realtime worker on folder."""
-        if not SAM2_AVAILABLE:
-            QMessageBox.critical(self, "Error", "SAM 2 library is not installed/importable.")
-            return
-
-        # if HDF5 source, export first
-        if getattr(self, 'h5_file_path', None) is not None:
-            # check that prompts exist for requested start frame before exporting
-            try:
-                start_frame = int(self.start_spin.value()) if hasattr(self, 'start_spin') else 0
-            except Exception:
-                start_frame = 0
-            start_frame_has_prompts = any(
-                len(self.get_prompts_for_object_in_frame(obj_id, start_frame)) > 0 
-                for obj_id in self.get_all_object_ids()
-            )
-            if not start_frame_has_prompts:
-                QMessageBox.critical(self, "Error", "No prompts for chosen start frame. Please add some prompts.")
-                return
-            try:
-                self.btn_track_realtime.setEnabled(False)
-                self.btn_autosegment.setEnabled(False)
-                self.status_label.setText("Exporting HDF5 frames to temporary folder for real-time tracking...")
-                self._export_worker = ExportH5Worker(self.h5_file_path, getattr(self, 'h5_dataset_name', None))
-                self._export_worker.stream_mode = False
-                self._export_worker.progress.connect(lambda p: self.status_label.setText(f"Exporting frames... {p}%"))
-                self._export_worker.ready.connect(self._on_h5_export_finished_realtime)
-                self._export_worker.finished.connect(self.on_tracking_finished)
-                self._export_worker.error.connect(self.on_tracking_error)
-                self._export_worker.start()
-                return
-            except Exception as e:
-                QMessageBox.critical(self, "Error", f"Failed to start HDF5 export: {e}")
-                return
-
-        # determine requested frame range from spinboxes (if present)
-        try:
-            start_frame = int(self.start_spin.value()) if hasattr(self, 'start_spin') else 0
-            end_frame = int(self.end_spin.value()) if hasattr(self, 'end_spin') else None
-        except Exception:
-            start_frame = 0
-            end_frame = None
-
-        # start realtime on folder
-        self._start_realtime_worker(self.video_path, start_frame=start_frame, end_frame=end_frame)
-
-    def _on_h5_export_finished_realtime(self, temp_folder):
-        # save export tempdir so cleanup happens later
-        self._h5_export_tempdir = temp_folder
-        # get requested start/end
-        try:
-            start_frame = int(self.start_spin.value()) if hasattr(self, 'start_spin') else 0
-            end_frame = int(self.end_spin.value()) if hasattr(self, 'end_spin') else None
-        except Exception:
-            start_frame = 0
-            end_frame = None
-        self._start_realtime_worker(temp_folder, start_frame=start_frame, end_frame=end_frame)
-
-    def _start_realtime_worker(self, video_folder, start_frame=0, end_frame=None):
-        try:
-            self.btn_track_realtime.setEnabled(False)
-            self.btn_pause_realtime.setEnabled(True)
-            self.btn_track.setEnabled(False)
-            self.btn_autosegment.setEnabled(False)
-            self.status_label.setText("Real-time tracking...")
-            # fetch prompts for the requested start frame for all objects
-            prompts = self.get_prompts_for_frame(start_frame)
-            if not any(prompts):  # Check if any object has prompts
-                QMessageBox.critical(self, "Error", "No prompts for chosen start frame. Please add some prompts.")
-                # re-enable UI
-                self.btn_track_realtime.setEnabled(True)
-                self.btn_pause_realtime.setEnabled(False)
-                self.btn_autosegment.setEnabled(True)
-                return
-
-            self._realtime_worker = RealTimeTrackerWorker(video_folder, self.device, prompts, colors=self.colors, model_size=getattr(self, 'model_size', 'base'), start_frame=start_frame, end_frame=end_frame)
-            self._realtime_worker.frameMask.connect(self._on_realtime_frame)
-            self._realtime_worker.finished.connect(self.on_tracking_finished)
-            self._realtime_worker.error.connect(self.on_tracking_error)
-            self._realtime_worker.start()
-            try:
-                self.btn_stop.setEnabled(True)
-            except Exception:
-                pass
-        except Exception as e:
-            QMessageBox.critical(self, "Error", f"Failed to start realtime tracker: {e}")
-            self.btn_track_realtime.setEnabled(True)
-            self.btn_pause_realtime.setEnabled(False)
-            self.btn_autosegment.setEnabled(True)
 
     def _start_tracker_worker(self, video_folder, start_frame=0, end_frame=None):
         """Start the TrackerWorker using the given video_folder path."""
@@ -2042,87 +1908,6 @@ class C_Elegans_GUI(QMainWindow):
 
         self.update_display()
 
-    def _on_realtime_frame(self, idx, color_mask_bgr):
-        """Receive per-frame color mask from realtime worker and display it immediately."""
-        try:
-            # read base image for this frame (folder-backed)
-            if self.image_files:
-                img_path = self.image_files[idx]
-                img = cv2.imread(img_path)
-            elif getattr(self, 'h5_file_path', None) and H5PY_AVAILABLE:
-                # load from HDF5 directly for display
-                try:
-                    with h5py.File(self.h5_file_path, 'r') as f:
-                        ds = self.h5_dataset_name if getattr(self, 'h5_dataset_name', None) is not None else next(iter(f.keys()))
-                        arr = np.asarray(f[ds][idx])
-                        if arr.ndim == 2:
-                            img = cv2.cvtColor(arr.astype(np.uint8), cv2.COLOR_GRAY2BGR)
-                        else:
-                            if arr.dtype != np.uint8:
-                                m = arr.max() if arr.max() != 0 else 1.0
-                                img = (255.0 * (arr.astype(np.float32) / m)).astype(np.uint8)
-                            else:
-                                img = arr.astype(np.uint8)
-                            if img.shape[2] == 3:
-                                # assume RGB in HDF5
-                                img = cv2.cvtColor(img, cv2.COLOR_RGB2BGR)
-                except Exception:
-                    return
-            else:
-                return
-
-            if img is None:
-                return
-
-            # compose color mask onto image (both BGR)
-            mask = color_mask_bgr
-            if mask.shape[:2] != img.shape[:2]:
-                mask = cv2.resize(mask, (img.shape[1], img.shape[0]), interpolation=cv2.INTER_NEAREST)
-            mask_indices = np.any(mask != [0, 0, 0], axis=-1)
-            composed = img.copy()
-            # Use dynamic opacity from slider
-            opacity = getattr(self, 'mask_opacity', 0.5)
-            composed[mask_indices] = cv2.addWeighted(composed[mask_indices], 1.0 - opacity, mask[mask_indices], opacity, 0)
-
-            # convert to RGB and display
-            img_rgb = cv2.cvtColor(composed, cv2.COLOR_BGR2RGB)
-            img_rgb = np.ascontiguousarray(img_rgb)
-            h, w, ch = img_rgb.shape
-            bytes_per_line = ch * w
-            q_img = QImage(img_rgb.data, w, h, bytes_per_line, QImage.Format_RGB888)
-            pixmap = QPixmap.fromImage(q_img)
-            scaled = pixmap.scaled(self.image_label.size(), Qt.KeepAspectRatio, Qt.SmoothTransformation)
-
-            # cache it (LRU)
-            try:
-                if len(self.pixmap_cache) >= self.pixmap_cache_max:
-                    try:
-                        self.pixmap_cache.popitem(last=False)
-                    except Exception:
-                        first_key = next(iter(self.pixmap_cache))
-                        self.pixmap_cache.pop(first_key, None)
-                self.pixmap_cache[idx] = scaled
-                try:
-                    self.pixmap_cache.move_to_end(idx, last=True)
-                except Exception:
-                    pass
-            except Exception:
-                self.pixmap_cache[idx] = scaled
-
-            # display and advance slider
-            self.current_frame_idx = idx
-            try:
-                self.image_label.setPixmap(scaled)
-            except Exception:
-                pass
-            try:
-                # update slider without causing heavy prefetch churn
-                self.slider.setValue(idx)
-            except Exception:
-                pass
-        except Exception:
-            pass
-
     def eventFilter(self, obj, event):
         # handle hover and clicks on the image label
         try:
@@ -2156,7 +1941,7 @@ class C_Elegans_GUI(QMainWindow):
                     try:
                         if self._last_loaded_rgb is not None:
                             orig_h, orig_w = self._last_loaded_rgb.shape[:2]
-                        elif getattr(self, 'h5_file_path', None) is not None and H5PY_AVAILABLE:
+                        elif getattr(self, 'h5_file_path', None) is not None:
                             try:
                                 with h5py.File(self.h5_file_path, 'r') as f:
                                     ds = self.h5_dataset_name if getattr(self, 'h5_dataset_name', None) is not None else next(iter(f.keys()))
@@ -2223,7 +2008,7 @@ class C_Elegans_GUI(QMainWindow):
 
                         if self._last_loaded_rgb is None:
                             try:
-                                if getattr(self, 'h5_file_path', None) is not None and H5PY_AVAILABLE:
+                                if getattr(self, 'h5_file_path', None) is not None:
                                     with h5py.File(self.h5_file_path, 'r') as f:
                                         ds = self.h5_dataset_name if getattr(self, 'h5_dataset_name', None) is not None else next(iter(f.keys()))
                                         arr = f[ds][self.current_frame_idx]
@@ -2307,7 +2092,7 @@ class C_Elegans_GUI(QMainWindow):
                         try:
                             if self._last_loaded_rgb is not None and self.current_frame_idx == self.current_frame_idx:
                                 orig_h, orig_w = self._last_loaded_rgb.shape[:2]
-                            elif getattr(self, 'h5_file_path', None) is not None and H5PY_AVAILABLE:
+                            elif getattr(self, 'h5_file_path', None) is not None:
                                 with h5py.File(self.h5_file_path, 'r') as f:
                                     ds = self.h5_dataset_name if getattr(self, 'h5_dataset_name', None) is not None else next(iter(f.keys()))
                                     arr = f[ds][self.current_frame_idx]
@@ -2364,20 +2149,6 @@ class C_Elegans_GUI(QMainWindow):
                     pass
         except Exception:
             pass
-        # Stop realtime worker if running
-        try:
-            if hasattr(self, '_realtime_worker') and getattr(self, '_realtime_worker') is not None:
-                try:
-                    try:
-                        self._realtime_worker.stop()
-                    except Exception:
-                        pass
-                    self._realtime_worker.wait(1000)
-                except Exception:
-                    pass
-        except Exception:
-            pass
-        # remove temporary exported HDF5 frames if present
         try:
             if getattr(self, '_h5_export_tempdir', None):
                 try:
@@ -2453,45 +2224,6 @@ class C_Elegans_GUI(QMainWindow):
                 child_layout = item.layout()
                 if child_layout is not None:
                     self.clear_layout(child_layout)
-
-
-    def toggle_realtime_pause(self):
-        """Toggle pause/resume of the realtime tracker worker."""
-        try:
-            worker = getattr(self, '_realtime_worker', None)
-            if worker is None:
-                return
-            if getattr(worker, '_paused', False):
-                try:
-                    worker.resume()
-                    self.btn_pause_realtime.setText("Pause Tracking")
-                    self.status_label.setText("Real-time tracking: resumed")
-                except Exception:
-                    pass
-            else:
-                try:
-                    worker.pause()
-                    self.btn_pause_realtime.setText("Resume Tracking")
-                    self.status_label.setText("Real-time tracking: paused")
-                except Exception:
-                    pass
-        except Exception:
-            pass
-        # close any open HDF5 handle
-        try:
-            if getattr(self, '_h5f', None) is not None:
-                try:
-                    self._h5f.close()
-                except Exception:
-                    pass
-                self._h5f = None
-        except Exception:
-            pass
-        self.wait()
-
-
-
-    # overlay helper was removed per user request
 
     def update_object_sidebar(self):
         """Populate the right-hand sidebar with + and - buttons per object."""
@@ -2569,17 +2301,9 @@ class C_Elegans_GUI(QMainWindow):
         # add stretch to push buttons to top
         self.object_button_layout.addStretch(1)
         # enable Track buttons when we have at least one object
+        has_objects = len(self.get_all_object_ids()) > 0
         try:
-            # enable if any object has prompts in any frame
-            has_objects = len(self.get_all_object_ids()) > 0
-            try:
-                self.btn_track.setEnabled(has_objects)
-            except Exception:
-                pass
-            try:
-                self.btn_track_realtime.setEnabled(has_objects)
-            except Exception:
-                pass
+            self.btn_track.setEnabled(has_objects)
         except Exception:
             pass
 
