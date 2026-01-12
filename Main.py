@@ -9,6 +9,11 @@ import shutil
 from datetime import datetime
 from tqdm import tqdm
 try:
+    from PIL import Image
+    PIL_AVAILABLE = True
+except Exception:
+    PIL_AVAILABLE = False
+try:
     import h5py
     H5PY_AVAILABLE = True
 except Exception:
@@ -30,10 +35,7 @@ except ImportError:
     SAM2_AVAILABLE = False
     print("Warning: SAM 2 library not found. Tracking will not function.")
 
-# --- Logic from your script (Refactored) ---
-
 def process_image_and_scale_centers(img, downsample_resolution=8, min_area=1000, max_area=50000, min_hole_area=100000, num_skeleton_points=10):
-    # [Exactly as provided in your prompt]
     original_height, original_width = img.shape[:2]
     new_width = original_width // downsample_resolution
     new_height = original_height // downsample_resolution
@@ -218,7 +220,8 @@ class TrackerWorker(QThread):
                         if mask.shape != (h, w):
                             mask = cv2.resize(mask.astype(np.uint8), (w, h), interpolation=cv2.INTER_NEAREST)
                         
-                        # Get color for this object ID
+                        # Get color for this object using SAM object ID
+                        # out_obj_id is 1, 2, 3... for GUI objects 0, 1, 2...
                         color = self.colors[out_obj_id % len(self.colors)]
                         
                         # Paint the color on the mask
@@ -243,11 +246,11 @@ class TrackerWorker(QThread):
                             print(f"Failed to compute centerline for object {out_obj_id} in frame {save_frame_index}: {e}")
                             frame_centerlines[out_obj_id] = ([], [])
 
-                # Save the pre-colored mask to the new folder as a compressed JPG
+                # Save the pre-colored mask to the new folder as PNG
                 # Only save if within requested start/end frame range
-                save_path = os.path.join(mask_output_dir, f"{save_frame_index}.jpg")
-                # Use reasonable JPEG quality to keep files small but good-looking
-                cv2.imwrite(save_path, color_mask, [int(cv2.IMWRITE_JPEG_QUALITY), 90])
+                save_path = os.path.join(mask_output_dir, f"{save_frame_index}.png")
+                # Use PNG compression level 9 for best compression
+                cv2.imwrite(save_path, color_mask, [int(cv2.IMWRITE_PNG_COMPRESSION), 9])
                 
                 # Store centerlines for this frame
                 all_centerlines[save_frame_index] = frame_centerlines
@@ -642,6 +645,8 @@ class RealTimeTrackerWorker(QThread):
                     if mask.sum() > 0:
                         if mask.shape != (h, w):
                             mask = cv2.resize(mask.astype(np.uint8), (w, h), interpolation=cv2.INTER_NEAREST)
+                        # Get color for this object using SAM object ID
+                        # out_obj_id is 1, 2, 3... for GUI objects 0, 1, 2...
                         color = self.colors[out_obj_id % len(self.colors)]
                         color_mask[mask > 0] = color
 
@@ -652,9 +657,9 @@ class RealTimeTrackerWorker(QThread):
                     except Exception:
                         pass
                     # save mask
-                    save_path = os.path.join(mask_output_dir, f"{out_frame_idx}.jpg")
+                    save_path = os.path.join(mask_output_dir, f"{out_frame_idx}.png")
                     try:
-                        cv2.imwrite(save_path, color_mask, [int(cv2.IMWRITE_JPEG_QUALITY), 90])
+                        cv2.imwrite(save_path, color_mask, [int(cv2.IMWRITE_PNG_COMPRESSION), 9])
                     except Exception:
                         pass
 
@@ -698,6 +703,8 @@ class C_Elegans_GUI(QMainWindow):
         self.centerlines = {}
         # Mask opacity (0.0 to 1.0, where 1.0 = fully opaque)
         self.mask_opacity = 0.5
+        # Prompt point size (radius for circles, half-size for X markers)
+        self.prompt_point_size = 15
         # Simple in-memory cache for recently-used color masks to speed up display
         self._mask_cache = {}
         self._mask_cache_max = 64
@@ -760,9 +767,14 @@ class C_Elegans_GUI(QMainWindow):
         btn_import_h5.setFixedSize(200, 50)
         btn_import_h5.clicked.connect(self.choose_hdf5)
 
+        btn_import_tif = QPushButton("Import TIF Video")
+        btn_import_tif.setFixedSize(200, 50)
+        btn_import_tif.clicked.connect(self.choose_tif)
+
         layout.addWidget(label)
         layout.addWidget(btn_select, alignment=Qt.AlignCenter)
         layout.addWidget(btn_import_h5, alignment=Qt.AlignCenter)
+        layout.addWidget(btn_import_tif, alignment=Qt.AlignCenter)
         self.selection_widget.setLayout(layout)
         self.stacked_widget.addWidget(self.selection_widget)
 
@@ -840,6 +852,94 @@ class C_Elegans_GUI(QMainWindow):
                 self.start_spin.setValue(0)
         except Exception:
             pass
+
+    def choose_tif(self):
+        """Import a TIF/TIFF video file (multi-frame TIFF stack)."""
+        if not PIL_AVAILABLE:
+            QMessageBox.critical(self, "Error", "Pillow (PIL) is not installed. Please install it to import TIF files.")
+            return
+        
+        path, _ = QFileDialog.getOpenFileName(self, "Select TIF/TIFF file", filter="TIF Files (*.tif *.tiff);;All Files (*)")
+        if not path:
+            return
+
+        try:
+            # Open the TIFF file to check how many frames it has
+            with Image.open(path) as img:
+                n_frames = getattr(img, 'n_frames', 1)
+            
+            if n_frames is None:
+                n_frames = 1
+            
+            self.status_label.setText(f"Loading TIF: {os.path.basename(path)} ({n_frames} frames)...")
+            
+            # Create a temporary directory to extract frames
+            temp_dir = tempfile.mkdtemp(prefix="tif_video_")
+            
+            # Extract frames from TIFF as JPG (required for SAM2 tracker)
+            with Image.open(path) as img:
+                for frame_idx in range(n_frames):
+                    try:
+                        img.seek(frame_idx)
+                        frame = img.convert('RGB')
+                        frame_path = os.path.join(temp_dir, f"{frame_idx:06d}.jpg")
+                        frame.save(frame_path, quality=95)
+                    except EOFError:
+                        # End of frames
+                        break
+            
+            # Load extracted frames just like a folder
+            self.video_path = temp_dir
+            files = [f for f in os.listdir(temp_dir) if f.lower().endswith(('.jpg', '.jpeg'))]
+            files.sort(key=lambda x: int(os.path.splitext(x)[0]))
+            
+            self.image_files = [os.path.join(temp_dir, f) for f in files]
+            
+            if not self.image_files:
+                QMessageBox.warning(self, "Error", "No frames could be extracted from the TIF file.")
+                shutil.rmtree(temp_dir)
+                return
+            
+            # Configure UI
+            self.slider.setMaximum(len(self.image_files) - 1)
+            self.slider.setEnabled(True)
+            self.frame_spinbox.setMaximum(len(self.image_files) - 1)
+            self.frame_spinbox.setEnabled(True)
+            self.btn_play.setEnabled(True)
+            self.stacked_widget.setCurrentIndex(1)
+            
+            # Update image loader references
+            try:
+                self._image_loader.set_references(self.image_files, self.tracking_mask_files, gui_instance=self)
+            except Exception:
+                pass
+            
+            self.clear_pixmap_cache()
+            self.update_display()
+            self.status_label.setText(f"Loaded TIF: {os.path.basename(path)} ({len(self.image_files)} frames)")
+            
+            # Prefetch first frames
+            try:
+                self._image_loader.request(self.current_frame_idx)
+                self._prefetch_neighbors(self.current_frame_idx)
+            except Exception:
+                pass
+            
+            # Update left-sidebar spinboxes if present
+            try:
+                n_frames = len(self.image_files)
+                if hasattr(self, 'end_spin'):
+                    self.end_spin.setMaximum(max(0, n_frames - 1))
+                    self.end_spin.setValue(max(0, n_frames - 1))
+                if hasattr(self, 'start_spin'):
+                    self.start_spin.setMaximum(max(0, n_frames - 1))
+                    self.start_spin.setValue(0)
+            except Exception:
+                pass
+                
+        except Exception as e:
+            QMessageBox.critical(self, "Error", f"Failed to load TIF file: {str(e)}")
+            return
 
     def get_all_object_ids(self):
         """Get sorted list of all object IDs that exist across all frames."""
@@ -1007,6 +1107,21 @@ class C_Elegans_GUI(QMainWindow):
         centerline_row_layout.addStretch()
         self.left_layout.addWidget(centerline_row_widget)
 
+        # Prompt point size row
+        prompt_point_row_widget = QWidget()
+        prompt_point_row_layout = QHBoxLayout()
+        prompt_point_row_layout.setContentsMargins(0, 0, 0, 0)
+        prompt_point_row_widget.setLayout(prompt_point_row_layout)
+        prompt_point_row_layout.addWidget(QLabel("Point Size:"))
+        self.prompt_point_size_spin = QSpinBox()
+        self.prompt_point_size_spin.setMinimum(1)
+        self.prompt_point_size_spin.setMaximum(50)
+        self.prompt_point_size_spin.setValue(15)
+        self.prompt_point_size_spin.setFixedWidth(60)
+        self.prompt_point_size_spin.valueChanged.connect(self._on_prompt_point_size_changed)
+        prompt_point_row_layout.addWidget(self.prompt_point_size_spin)
+        prompt_point_row_layout.addStretch()
+        self.left_layout.addWidget(prompt_point_row_widget)
 
         # Buttons
         btn_layout = QHBoxLayout()
@@ -1240,6 +1355,23 @@ class C_Elegans_GUI(QMainWindow):
         except Exception:
             pass
 
+    def _on_prompt_point_size_changed(self, value):
+        """Handle prompt point size spinbox changes."""
+        self.prompt_point_size = value
+        # Clear pixmap cache so prompts get redrawn with new size
+        self.clear_pixmap_cache()
+        # Request reload of current frame to show new point size immediately
+        try:
+            self._image_loader.request(self.current_frame_idx)
+        except Exception:
+            pass
+        # Update button highlight border width if an object is currently selected
+        if self.selected_object_idx is not None:
+            try:
+                self.on_object_button_clicked(self.selected_object_idx, self.selected_prompt_mode)
+            except Exception:
+                pass
+
     def _resample_centerline(self, centerline, num_points):
         """Resample centerline to desired number of points (same logic as TrackerWorker)."""
         if len(centerline) <= 1:
@@ -1325,8 +1457,9 @@ class C_Elegans_GUI(QMainWindow):
                         if label == 1:
                             # Positive prompt: draw circle
                             if is_selected:
-                                sel_radius = circle_radius + 12
-                                inner_radius = circle_radius + 4
+                                # Selection outline scales proportionally with point size
+                                sel_radius = int(circle_radius * 1.8)
+                                inner_radius = int(circle_radius * 1.3)
                                 cv2.circle(img_bgr, (cx_i, cy_i), sel_radius, gold_bgr, -1)
                                 cv2.circle(img_bgr, (cx_i, cy_i), inner_radius, color_bgr, -1)
                                 cv2.circle(img_bgr, (cx_i, cy_i), inner_radius, outline_bgr, 4)
@@ -1340,7 +1473,7 @@ class C_Elegans_GUI(QMainWindow):
                         else:
                             # Negative prompt: draw X
                             if is_selected:
-                                x_half = x_size + 8
+                                x_half = int(x_size * 1.4)
                                 cv2.line(img_bgr, (cx_i - x_half, cy_i - x_half), (cx_i + x_half, cy_i + x_half), gold_bgr, 8)
                                 cv2.line(img_bgr, (cx_i - x_half, cy_i + x_half), (cx_i + x_half, cy_i - x_half), gold_bgr, 8)
                                 cv2.line(img_bgr, (cx_i - x_half + 4, cy_i - x_half + 4), (cx_i + x_half - 4, cy_i + x_half - 4), color_bgr, 6)
@@ -1634,8 +1767,8 @@ class C_Elegans_GUI(QMainWindow):
                 # Draw filled circles for positive and X markers for negative prompts
                 # Convert RGB->BGR for OpenCV drawing, then back to RGB
                 img_bgr = cv2.cvtColor(img_rgb, cv2.COLOR_RGB2BGR)
-                circle_radius = 15
-                x_size = 18
+                circle_radius = self.prompt_point_size
+                x_size = self.prompt_point_size + 3
                 # bright red in BGR for selection highlight
                 gold_bgr = (0, 0, 255)
                 text_bgr = (255, 255, 255)
@@ -1655,47 +1788,39 @@ class C_Elegans_GUI(QMainWindow):
                             
                             if label == 1:
                                 # Positive prompt: draw circle
-                                if is_selected:
-                                    # draw red outer ring then inner filled color to emphasize selection
-                                    sel_radius = circle_radius + 12
-                                    inner_radius = circle_radius + 4
-                                    cv2.circle(img_bgr, (cx_i, cy_i), sel_radius, gold_bgr, -1)
-                                    cv2.circle(img_bgr, (cx_i, cy_i), inner_radius, color_bgr, -1)
-                                    cv2.circle(img_bgr, (cx_i, cy_i), inner_radius, outline_bgr, 4)
-                                    try:
-                                        cv2.putText(img_bgr, str(obj_id+1), (cx_i+inner_radius+2, cy_i-inner_radius-2), cv2.FONT_HERSHEY_SIMPLEX, 0.7, text_bgr, 3, cv2.LINE_AA)
-                                    except Exception:
-                                        pass
-                                else:
-                                    cv2.circle(img_bgr, (cx_i, cy_i), circle_radius, color_bgr, -1)
-                                    cv2.circle(img_bgr, (cx_i, cy_i), circle_radius, outline_bgr, 1)
-                                    try:
+                                # Draw filled circle with color
+                                cv2.circle(img_bgr, (cx_i, cy_i), circle_radius, color_bgr, -1)
+                                # Draw outline (gold if selected, black if not)
+                                outline_color = gold_bgr if is_selected else outline_bgr
+                                outline_thickness = 2 if is_selected else 1
+                                cv2.circle(img_bgr, (cx_i, cy_i), circle_radius, outline_color, outline_thickness)
+                                # Draw label
+                                try:
+                                    if is_selected:
+                                        cv2.putText(img_bgr, str(obj_id+1), (cx_i+circle_radius+2, cy_i-circle_radius-2), cv2.FONT_HERSHEY_SIMPLEX, 0.7, text_bgr, 3, cv2.LINE_AA)
+                                    else:
                                         cv2.putText(img_bgr, str(obj_id+1), (cx_i+8, cy_i-8), cv2.FONT_HERSHEY_SIMPLEX, 0.5, text_bgr, 1, cv2.LINE_AA)
-                                    except Exception:
-                                        pass
+                                except Exception:
+                                    pass
                             else:
                                 # Negative prompt: draw X
-                                if is_selected:
-                                    # draw thick X with gold outline
-                                    x_half = x_size + 8
-                                    cv2.line(img_bgr, (cx_i - x_half, cy_i - x_half), (cx_i + x_half, cy_i + x_half), gold_bgr, 8)
-                                    cv2.line(img_bgr, (cx_i - x_half, cy_i + x_half), (cx_i + x_half, cy_i - x_half), gold_bgr, 8)
-                                    cv2.line(img_bgr, (cx_i - x_half + 4, cy_i - x_half + 4), (cx_i + x_half - 4, cy_i + x_half - 4), color_bgr, 6)
-                                    cv2.line(img_bgr, (cx_i - x_half + 4, cy_i + x_half - 4), (cx_i + x_half - 4, cy_i - x_half + 4), color_bgr, 6)
-                                    try:
+                                x_half = x_size // 2
+                                # Draw X lines with color
+                                cv2.line(img_bgr, (cx_i - x_half, cy_i - x_half), (cx_i + x_half, cy_i + x_half), color_bgr, 4)
+                                cv2.line(img_bgr, (cx_i - x_half, cy_i + x_half), (cx_i + x_half, cy_i - x_half), color_bgr, 4)
+                                # Draw outline (gold if selected, black if not)
+                                outline_color = gold_bgr if is_selected else outline_bgr
+                                outline_thickness = 2 if is_selected else 1
+                                cv2.line(img_bgr, (cx_i - x_half, cy_i - x_half), (cx_i + x_half, cy_i + x_half), outline_color, outline_thickness)
+                                cv2.line(img_bgr, (cx_i - x_half, cy_i + x_half), (cx_i + x_half, cy_i - x_half), outline_color, outline_thickness)
+                                # Draw label
+                                try:
+                                    if is_selected:
                                         cv2.putText(img_bgr, str(obj_id+1), (cx_i+x_half+2, cy_i-x_half-2), cv2.FONT_HERSHEY_SIMPLEX, 0.7, text_bgr, 3, cv2.LINE_AA)
-                                    except Exception:
-                                        pass
-                                else:
-                                    x_half = x_size // 2
-                                    cv2.line(img_bgr, (cx_i - x_half, cy_i - x_half), (cx_i + x_half, cy_i + x_half), color_bgr, 4)
-                                    cv2.line(img_bgr, (cx_i - x_half, cy_i + x_half), (cx_i + x_half, cy_i - x_half), color_bgr, 4)
-                                    cv2.line(img_bgr, (cx_i - x_half, cy_i - x_half), (cx_i + x_half, cy_i + x_half), outline_bgr, 1)
-                                    cv2.line(img_bgr, (cx_i - x_half, cy_i + x_half), (cx_i + x_half, cy_i - x_half), outline_bgr, 1)
-                                    try:
+                                    else:
                                         cv2.putText(img_bgr, str(obj_id+1), (cx_i+x_half+2, cy_i-x_half-2), cv2.FONT_HERSHEY_SIMPLEX, 0.5, text_bgr, 1, cv2.LINE_AA)
-                                    except Exception:
-                                        pass
+                                except Exception:
+                                    pass
                     except Exception:
                         continue
                 # convert back to RGB for Qt
@@ -2414,14 +2539,14 @@ class C_Elegans_GUI(QMainWindow):
                 # + button for positive prompts
                 btn_plus = QPushButton("+")
                 btn_plus.setFixedSize(35, 30)
-                base_style_plus = f"background-color: rgb({r},{g},{b}); color: {text_color}; font-size: 16px; font-weight: bold; border-radius: 6px;"
+                base_style_plus = f"background-color: rgb({r},{g},{b}); color: {text_color}; font-size: 16px; font-weight: bold; border-radius: 6px; padding: 0px; margin: 0px;"
                 btn_plus.setStyleSheet(base_style_plus)
                 btn_plus.clicked.connect(lambda _, oid=obj_id: self.on_object_button_clicked(oid, mode=1))
 
                 # - button for negative prompts
                 btn_minus = QPushButton("-")
                 btn_minus.setFixedSize(35, 30)
-                base_style_minus = f"background-color: rgb({r},{g},{b}); color: {text_color}; font-size: 16px; font-weight: bold; border-radius: 6px;"
+                base_style_minus = f"background-color: rgb({r},{g},{b}); color: {text_color}; font-size: 16px; font-weight: bold; border-radius: 6px; padding: 0px; margin: 0px;"
                 btn_minus.setStyleSheet(base_style_minus)
                 btn_minus.clicked.connect(lambda _, oid=obj_id: self.on_object_button_clicked(oid, mode=0))
 
@@ -2466,6 +2591,10 @@ class C_Elegans_GUI(QMainWindow):
         self.status_label.setText(f"Selected object {obj_id+1} - {mode_str} mode")
 
         # update visual highlight for buttons
+        # Scale border width with point size
+        border_width = max(1, min(4, self.prompt_point_size // 5))
+        print(f"Chosen border width: {border_width}")
+        
         for obj_id_stored, btn_plus, btn_minus in self.object_buttons:
             try:
                 # recompute base color
@@ -2475,17 +2604,17 @@ class C_Elegans_GUI(QMainWindow):
                 text_color = '#000000' if luminance > 180 else '#FFFFFF'
                 
                 if obj_id_stored == obj_id:
-                    # Highlight the selected button with golden border
+                    # Highlight the selected button with golden border that scales with point size
                     if mode == 1:  # + button selected
-                        btn_plus.setStyleSheet(f"background-color: rgb({r},{g},{b}); color: {text_color}; font-size: 16px; font-weight: bold; border: 3px solid #FFD700; border-radius: 6px;")
-                        btn_minus.setStyleSheet(f"background-color: rgb({r},{g},{b}); color: {text_color}; font-size: 16px; font-weight: bold; border-radius: 6px;")
+                        btn_plus.setStyleSheet(f"background-color: rgb({r},{g},{b}); color: {text_color}; font-size: 16px; font-weight: bold; border: {border_width}px solid #FFD700; border-radius: 6px; padding: 0px; margin: 0px;")
+                        btn_minus.setStyleSheet(f"background-color: rgb({r},{g},{b}); color: {text_color}; font-size: 16px; font-weight: bold; border-radius: 6px; padding: 0px; margin: 0px;")
                     else:  # - button selected
-                        btn_plus.setStyleSheet(f"background-color: rgb({r},{g},{b}); color: {text_color}; font-size: 16px; font-weight: bold; border-radius: 6px;")
-                        btn_minus.setStyleSheet(f"background-color: rgb({r},{g},{b}); color: {text_color}; font-size: 16px; font-weight: bold; border: 3px solid #FFD700; border-radius: 6px;")
+                        btn_plus.setStyleSheet(f"background-color: rgb({r},{g},{b}); color: {text_color}; font-size: 16px; font-weight: bold; border-radius: 6px; padding: 0px; margin: 0px;")
+                        btn_minus.setStyleSheet(f"background-color: rgb({r},{g},{b}); color: {text_color}; font-size: 16px; font-weight: bold; border: {border_width}px solid #FFD700; border-radius: 6px; padding: 0px; margin: 0px;")
                 else:
                     # Not selected - normal style
-                    btn_plus.setStyleSheet(f"background-color: rgb({r},{g},{b}); color: {text_color}; font-size: 16px; font-weight: bold; border-radius: 6px;")
-                    btn_minus.setStyleSheet(f"background-color: rgb({r},{g},{b}); color: {text_color}; font-size: 16px; font-weight: bold; border-radius: 6px;")
+                    btn_plus.setStyleSheet(f"background-color: rgb({r},{g},{b}); color: {text_color}; font-size: 16px; font-weight: bold; border-radius: 6px; padding: 0px; margin: 0px;")
+                    btn_minus.setStyleSheet(f"background-color: rgb({r},{g},{b}); color: {text_color}; font-size: 16px; font-weight: bold; border-radius: 6px; padding: 0px; margin: 0px;")
             except Exception as e:
                 print(e)
                 pass
