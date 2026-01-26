@@ -15,11 +15,16 @@ from PIL import Image
 import h5py
 from PyQt5.QtWidgets import (QApplication, QMainWindow, QWidget, QVBoxLayout, 
                              QHBoxLayout, QPushButton, QLabel, QFileDialog, 
-                             QStackedWidget, QSlider, QMessageBox, QProgressBar, QComboBox, QScrollArea, QSpinBox, QCheckBox)
+                             QStackedWidget, QSlider, QMessageBox, QProgressBar, QComboBox, QScrollArea, QSpinBox, QCheckBox, QMenuBar, QMenu, QAction)
 from PyQt5.QtCore import Qt, QThread, pyqtSignal, QTimer, QEvent
 from PyQt5.QtGui import QImage, QPixmap, QPainter, QColor, QPen, QFont
 from queue import Queue, Empty
 from collections import OrderedDict
+
+from multiscale_sem import process_image_and_scale_centers # for multiscale sem use case
+from functools import wraps
+from contextlib import contextmanager
+import traceback
 
 # --- Check for SAM 2 ---
 try:
@@ -29,77 +34,44 @@ except ImportError:
     SAM2_AVAILABLE = False
     print("Warning: SAM 2 library not found. Tracking will not function.")
 
-def process_image_and_scale_centers(img, downsample_resolution=8, min_area=1000, max_area=50000, min_hole_area=100000, num_skeleton_points=10):
-    original_height, original_width = img.shape[:2]
-    new_width = original_width // downsample_resolution
-    new_height = original_height // downsample_resolution
-    
-    downsampled_img = cv2.resize(img, (new_width, new_height))
-    
-    if len(downsampled_img.shape) == 3:
-        gray_img = cv2.cvtColor(downsampled_img, cv2.COLOR_BGR2GRAY)
-    else:
-        gray_img = downsampled_img
+# --- utilities ---
+def report_errors(func):
+    """Decorator to catch errors and emit them via the object's error signal."""
+    @wraps(func)
+    def wrapper(self, *args, **kwargs):
+        try:
+            return func(self, *args, **kwargs)
+        except Exception as e:
+            traceback.print_exc()
+            if hasattr(self, 'error'):
+                self.error.emit(str(e))
+    return wrapper
 
-    blurred = cv2.GaussianBlur(gray_img, (5, 5), 0)
-    _, initial_mask = cv2.threshold(blurred, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
-
-    inv_mask = 255 - initial_mask
-    num_labels, labels, stats, centroids = cv2.connectedComponentsWithStats(inv_mask, connectivity=8)
-    filtered_mask = initial_mask.copy()
-    
-    for i in range(1, num_labels):
-        area = stats[i, cv2.CC_STAT_AREA]
-        if area < min_area:
-            filtered_mask[labels == i] = 255
-        elif area > max_area:
-            filtered_mask[labels == i] = 255
-
-    filled_mask = filtered_mask.copy()
-    num_labels_white, labels_white, stats_white, centroids_white = cv2.connectedComponentsWithStats(filled_mask, connectivity=8)
-    
-    for i in range(1, num_labels_white):
-        if stats_white[i, cv2.CC_STAT_AREA] < min_hole_area:
-            filled_mask[labels_white == i] = 0
-
-    mask = filled_mask
-    num_labels_blobs, labels_blobs, stats_blobs, centroids_blobs = cv2.connectedComponentsWithStats(255 - mask, connectivity=8)
-    blob_centers = []
-    
-    for i in range(1, num_labels_blobs):
-        area = stats_blobs[i, cv2.CC_STAT_AREA]
-        if area >= min_area:
-            blob_mask = (labels_blobs == i).astype(np.uint8)
-            skeleton = skeletonize(blob_mask)
-            skeleton_points = np.where(skeleton)
-            
-            if len(skeleton_points[0]) > 0:
-                all_points = [(skeleton_points[1][j], skeleton_points[0][j]) for j in range(len(skeleton_points[0]))]
-                N = len(all_points)
-                if N <= num_skeleton_points:
-                    blob_skeleton_points = all_points
-                else:
-                    indices = np.linspace(0, N-1, num_skeleton_points, dtype=int)
-                    blob_skeleton_points = [all_points[j] for j in indices]
-                blob_centers.append(blob_skeleton_points)
-
-    scaled_blob_centers = []
-    for blob_points in blob_centers:
-        scaled_points = [(int(cx * downsample_resolution), int(cy * downsample_resolution)) for cx, cy in blob_points]
-        scaled_blob_centers.append(scaled_points)
-    return scaled_blob_centers
+@contextmanager
+def sam2_cleanup(device):
+    """Context manager to ensure GPU/MPS memory is cleared after a block of code."""
+    try:
+        yield
+    finally:
+        import gc
+        gc.collect()
+        if device.type == "mps":
+            torch.mps.empty_cache()
+        elif device.type == "cuda":
+            torch.cuda.empty_cache()
 
 # --- Worker Thread for Heavy SAM 2 Processing ---
 class TrackerWorker(QThread):
     finished = pyqtSignal(str) # Emits the path to the mask folder
     progress = pyqtSignal(int) # Optional: to show progress if you added a bar
-    error = pyqtSignal(str)
+    error = pyqtSignal(str) # Emits error messages
     maskSaved = pyqtSignal(int, str) # Emits (frame_idx, mask_file_path) when mask is saved
     centerlineComputed = pyqtSignal(int, dict) # Emits (frame_idx, {obj_id: centerline_points})
 
-    def __init__(self, video_path, device, scaled_blob_centers, colors=None, model_size='base', start_frame=0, end_frame=None, video_name=None, num_centerline_points=100):
+    def __init__(self, video_path, device, scaled_blob_centers, colors=None, model_size='base', start_frame=0, end_frame=None, video_name=None, num_centerline_points=100, save_mask_dir=None):
+        """Initialize TrackerWorker for SAM2 video tracking."""
         super().__init__()
-        self.save_mask_dir = "/Users/huayinluo/Documents/code/zhenlab/MultiscaleSEM/masks"
+        self.save_mask_dir = save_mask_dir or "/Users/huayinluo/Documents/code/zhenlab/MultiscaleSEM/masks"
         self.video_path = video_path
         self.device = device
         self.scaled_blob_centers = scaled_blob_centers
@@ -134,156 +106,117 @@ class TrackerWorker(QThread):
             resampled = [centerline[j] for j in indices]
             return resampled
 
+    def init_sam_predictor(self, model_size):
+        """Initialize SAM2 predictor based on model size."""
+        if model_size == 'tiny':
+            sam2_checkpoint = "./checkpoints/sam2.1_hiera_tiny.pt"
+            model_cfg = "configs/sam2.1/sam2.1_hiera_t.yaml"
+        elif model_size == 'base':
+            sam2_checkpoint = "./checkpoints/sam2.1_hiera_base_plus.pt"
+            model_cfg = "configs/sam2.1/sam2.1_hiera_b+.yaml"
+        elif model_size == 'large':
+            sam2_checkpoint = "./checkpoints/sam2.1_hiera_large.pt"
+            model_cfg = "configs/sam2.1/sam2.1_hiera_l.yaml"
+        else:
+            raise ValueError(f"Unknown model size: {model_size}")
+
+        if not os.path.exists(sam2_checkpoint):
+            raise FileNotFoundError(f"Checkpoint not found: {sam2_checkpoint}")
+
+        print(f"Initializing SAM2 predictor with checkpoint: {sam2_checkpoint}")
+        predictor = build_sam2_video_predictor(model_cfg, sam2_checkpoint, device=self.device)
+        return predictor
+    
+    def _copy_frame_files(self, src_dir, dst_dir, start_frame, end_frame):
+        """Copy frame files from src_dir to dst_dir for frames in [start_frame, end_frame]."""
+        frame_files = sorted([f for f in os.listdir(src_dir) if f.lower().endswith(('.jpg', '.jpeg', '.png'))])
+        for absolute_idx in range(start_frame, end_frame + 1):
+            src_frame = os.path.join(src_dir, frame_files[absolute_idx])
+            dst_frame = os.path.join(dst_dir, f"{absolute_idx - start_frame:06d}.jpg")
+            shutil.copy2(src_frame, dst_frame)
+    
+
+    def _copy_frame_safe(self, src_frame, dst_frame):
+        """Copy a single frame file from src_path to dst_path.
+        Try symlink, then hard link, then copy.
+        """
+        # Try symlink first (fastest, cross-platform)
+        try:
+            os.symlink(src_frame, dst_frame)
+        except (OSError, NotImplementedError):
+            # Windows without admin or different filesystem
+            # Try hard link (works on same drive, faster than copy)
+            try:
+                os.link(src_frame, dst_frame)
+            except (OSError, NotImplementedError):
+                # Different drives or filesystem doesn't support hard links
+                # Last resort: copy (slower but always works)
+                shutil.copy2(src_frame, dst_frame)
+            
+    @report_errors
     def run(self):
         """Run tracking in chunks to avoid OOM errors."""
+        # Setup output directory for masks
+        # --- Create unique timestamped folder ---
+        ts = datetime.now().strftime("%Y%m%d_%H%M%S")
+        mask_output_dir = os.path.join(self.save_mask_dir, f"{self.video_name}_masks_{ts}")
+        os.makedirs(mask_output_dir, exist_ok=True)
+        print(f"Initialized mask output directory at: {mask_output_dir}")
+
+        # Get total frame count
+        frame_files = sorted([f for f in os.listdir(self.video_path) if f.lower().endswith(('.jpg', '.jpeg', '.png'))])
+        total_frames = len(frame_files)
+        actual_end_frame = self.end_frame if self.end_frame is not None else total_frames - 1
+        
+        # Initialize SAM2 predictor ONCE (will be reused for all chunks)
+        model_size = getattr(self, 'model_size', 'base')
+        predictor = self.init_sam_predictor(model_size)
+        
+        # Initial prompts for first chunk
+        current_prompts = self.scaled_blob_centers
+        # Initialize centerlines storage
+        all_centerlines = {}
+        
+        # Process in chunks
+        chunk_start = self.start_frame
+        while chunk_start <= actual_end_frame and not self._stop_requested:
+            chunk_end = min(chunk_start + self.chunk_size - 1, actual_end_frame)
+            print(f"\n=== Tracking chunk: frames {chunk_start} to {chunk_end} ===")
+                
+            # (1) make a temp dir for this chunk
+            # since SAM2 requires a video folder input
+            tracking_temp_dir = tempfile.mkdtemp(prefix="sam2_tracking_chunk_")
+            for relative_idx, absolute_idx in enumerate(range(chunk_start, chunk_end + 1)):
+                src_frame = os.path.join(self.video_path, frame_files[absolute_idx])
+                dst_frame = os.path.join(tracking_temp_dir, f"{relative_idx:06d}.jpg")
+                self._copy_frame_safe(src_frame, dst_frame)
+            print(f"Created tracking subset folder {tracking_temp_dir} with frames {chunk_start} to {chunk_end}")
+
+            # Use Context Manager for automatic cleanup of temp files and GPU memory
+            with sam2_cleanup(self.device):
+                try:
+                    inference_state = predictor.init_state(video_path=tracking_temp_dir)
+                    chunk_results = self._track_chunk(predictor, inference_state, chunk_start, chunk_end, current_prompts, mask_output_dir)
+                    all_centerlines.update(chunk_results)
+                    
+                    if chunk_end < actual_end_frame:
+                        current_prompts = self._centerlines_to_prompts(chunk_results.get(chunk_end, {}))
+                        if not any(current_prompts): break
+                finally:
+                    shutil.rmtree(tracking_temp_dir)
+            # Move to next chunk
+            chunk_start = chunk_end + 1
+        
+        # Save all centerlines
+        centerlines_path = os.path.join(mask_output_dir, "centerlines.npy")
         try:
-            # Setup output directory
-            ts = datetime.now().strftime("%Y%m%d_%H%M%S")
-            mask_output_dir = os.path.join(self.save_mask_dir, f"{self.video_name}_masks_{ts}")
-            os.makedirs(mask_output_dir, exist_ok=True)
-            print(f"Initialized mask output directory at: {mask_output_dir}")
-
-            # Get total frame count
-            frame_files = sorted([f for f in os.listdir(self.video_path) if f.lower().endswith(('.jpg', '.jpeg', '.png'))])
-            total_frames = len(frame_files)
-            
-            # Determine actual end frame
-            actual_end_frame = self.end_frame if self.end_frame is not None else total_frames - 1
-            
-            # Create a temporary folder with symlinks/hardlinks to ONLY the frames we want to track
-            tracking_temp_dir = tempfile.mkdtemp(prefix="sam2_tracking_")
-            try:
-                for i in range(self.start_frame, actual_end_frame + 1):
-                    src_frame = os.path.join(self.video_path, frame_files[i])
-                    dst_frame = os.path.join(tracking_temp_dir, f"{i:06d}.jpg")
-                    
-                    # Try symlink first (fastest, cross-platform)
-                    try:
-                        os.symlink(src_frame, dst_frame)
-                    except (OSError, NotImplementedError):
-                        # Windows without admin or different filesystem
-                        # Try hard link (works on same drive, faster than copy)
-                        try:
-                            os.link(src_frame, dst_frame)
-                        except (OSError, NotImplementedError):
-                            # Different drives or filesystem doesn't support hard links
-                            # Last resort: copy (slower but always works)
-                            shutil.copy2(src_frame, dst_frame)
-                print(f"Created tracking subset with frames {self.start_frame} to {actual_end_frame}")
-            except Exception as e:
-                print(f"Error creating tracking subset: {e}")
-                shutil.rmtree(tracking_temp_dir)
-                raise e
-
-
-            # Initialize centerlines storage
-            all_centerlines = {}
-            
-            # Initialize SAM2 predictor ONCE before all chunks (this loads video frames once)
-            model_size = getattr(self, 'model_size', 'base')
-            if model_size == 'tiny':
-                sam2_checkpoint = "./checkpoints/sam2.1_hiera_tiny.pt"
-                model_cfg = "configs/sam2.1/sam2.1_hiera_t.yaml"
-            elif model_size == 'base':
-                sam2_checkpoint = "./checkpoints/sam2.1_hiera_base_plus.pt"
-                model_cfg = "configs/sam2.1/sam2.1_hiera_b+.yaml"
-            elif model_size == 'large':
-                sam2_checkpoint = "./checkpoints/sam2.1_hiera_large.pt"
-                model_cfg = "configs/sam2.1/sam2.1_hiera_l.yaml"
-            else:
-                self.error.emit(f"Unknown model size: {model_size}")
-                return
-
-            if not os.path.exists(sam2_checkpoint):
-                self.error.emit(f"Checkpoint not found: {sam2_checkpoint}")
-                return
-
-            print(f"Initializing SAM2 predictor with checkpoint: {sam2_checkpoint}")
-            predictor = build_sam2_video_predictor(model_cfg, sam2_checkpoint, device=self.device)
-            inference_state = predictor.init_state(video_path=tracking_temp_dir)
-            print(f"Predictor initialized for video with {total_frames} total frames")
-            
-            # Initial prompts for first chunk
-            current_prompts = self.scaled_blob_centers
-            
-            # Process in chunks
-            chunk_start = self.start_frame
-            while chunk_start <= actual_end_frame and not self._stop_requested:
-                chunk_end = min(chunk_start + self.chunk_size - 1, actual_end_frame)
-                print(f"\n=== Processing chunk: frames {chunk_start} to {chunk_end} ===")
-                
-                # Track this chunk (pass predictor and inference_state)
-                chunk_centerlines = self._track_chunk(
-                    predictor,
-                    inference_state,
-                    chunk_start, 
-                    chunk_end, 
-                    current_prompts, 
-                    mask_output_dir
-                )
-                
-                # Merge centerlines
-                all_centerlines.update(chunk_centerlines)
-                
-                # If there's another chunk, prepare prompts from last frame's centerlines
-                if chunk_end < actual_end_frame and not self._stop_requested:
-                    print(f"Preparing prompts for next chunk from frame {chunk_end}")
-                    current_prompts = self._centerlines_to_prompts(chunk_centerlines.get(chunk_end, {}))
-                    
-                    if not current_prompts or all(len(p) == 0 for p in current_prompts):
-                        print(f"Warning: No centerlines found in frame {chunk_end}, stopping tracking.")
-                        break
-                    
-                    # Cleanup before next chunk
-                    import gc
-                    gc.collect()
-                    if self.device.type == "mps":
-                        try:
-                            torch.mps.empty_cache()
-                        except Exception:
-                            pass
-                    elif self.device.type == "cuda":
-                        try:
-                            torch.cuda.empty_cache()
-                        except Exception:
-                            pass
-                
-                # Move to next chunk
-                chunk_start = chunk_end + 1
-            
-            # Cleanup after all chunks
-            try:
-                del predictor
-                del inference_state
-            except Exception:
-                pass
-            import gc
-            gc.collect()
-            if self.device.type == "mps":
-                try:
-                    torch.mps.empty_cache()
-                except Exception:
-                    pass
-            elif self.device.type == "cuda":
-                try:
-                    torch.cuda.empty_cache()
-                except Exception:
-                    pass
-            
-            # Save all centerlines
-            centerlines_path = os.path.join(mask_output_dir, "centerlines.npy")
-            try:
-                np.save(centerlines_path, all_centerlines)
-                print(f"Saved centerlines to {centerlines_path}")
-            except Exception as e:
-                print(f"Failed to save centerlines: {e}")
-            
-            self.finished.emit(mask_output_dir)
-
+            np.save(centerlines_path, all_centerlines)
+            print(f"Saved centerlines to {centerlines_path}")
         except Exception as e:
-            import traceback
-            traceback.print_exc()
-            self.error.emit(str(e))
+            print(f"Failed to save centerlines: {e}")
+        
+        self.finished.emit(mask_output_dir)
+
 
     def _track_chunk(self, predictor, inference_state, chunk_start, chunk_end, prompts, mask_output_dir):
         """Track a single chunk of frames using pre-initialized predictor and inference_state."""
@@ -298,7 +231,7 @@ class TrackerWorker(QThread):
             labels = np.array([lbl for _, lbl in obj_prompts], dtype=np.int32)
             predictor.add_new_points_or_box(
                 inference_state=inference_state,
-                frame_idx=chunk_start,
+                frame_idx=0,
                 obj_id=ann_obj_id,
                 points=points,
                 labels=labels,
@@ -325,7 +258,6 @@ class TrackerWorker(QThread):
                 # Create color mask
                 color_mask = np.zeros((h, w, 3), dtype=np.uint8)
                 frame_centerlines = {}
-
                 for i, out_obj_id in enumerate(out_obj_ids):
                     mask = (out_mask_logits[i] > 0.0).cpu().numpy().squeeze()
                     
@@ -358,11 +290,8 @@ class TrackerWorker(QThread):
                 chunk_centerlines[save_frame_index] = frame_centerlines
                 
                 # Emit signals
-                try:
-                    self.maskSaved.emit(save_frame_index, save_path)
-                    self.centerlineComputed.emit(save_frame_index, frame_centerlines)
-                except Exception:
-                    pass
+                self.maskSaved.emit(save_frame_index, save_path)
+                self.centerlineComputed.emit(save_frame_index, frame_centerlines)
                 
                 # Clean up tensors
                 try:
@@ -418,7 +347,9 @@ class TrackerWorker(QThread):
             obj_prompts = [((x, y), 1) for x, y in resampled_points]
             prompts.append(obj_prompts)
         
-        return prompts# --- GUI Components ---
+        return prompts
+
+# --- Background Loading Components ---
 
 class ImageLoader(QThread):
     """Background loader that reads frames and (optionally) pre-colored masks,
@@ -428,6 +359,7 @@ class ImageLoader(QThread):
     frameLoaded = pyqtSignal(int, object)
 
     def __init__(self, parent=None):
+        """Initialize ImageLoader background thread for loading frames."""
         super().__init__(parent)
         self._req_q = Queue()
         self._running = True
@@ -442,6 +374,7 @@ class ImageLoader(QThread):
         self._h5_n_frames = None
 
     def set_references(self, image_files=None, mask_files=None, h5_path=None, h5_dataset=None, gui_instance=None):
+        """Set references to data sources (image files, masks, or HDF5) for loading frames."""
         self.image_files = image_files
         self.mask_files = mask_files
         self.h5_path = h5_path
@@ -452,6 +385,7 @@ class ImageLoader(QThread):
         # if image_files given and it's a list, we keep it; otherwise None
 
     def request(self, idx):
+        """Request loading of a specific frame by index."""
         try:
             self._req_q.put_nowait(idx)
         except Exception:
@@ -461,6 +395,7 @@ class ImageLoader(QThread):
                 pass
 
     def run(self):
+        """Main loop for loading and composing frames in background thread."""
         while self._running:
             try:
                 idx = self._req_q.get(timeout=0.1)
@@ -559,6 +494,7 @@ class ImageLoader(QThread):
                 continue
 
     def stop(self):
+        """Stop the image loader thread."""
         self._running = False
         try:
             self._req_q.put(None)
@@ -575,6 +511,7 @@ class ExportH5Worker(QThread):
     error = pyqtSignal(str)
 
     def __init__(self, h5_path, start_frame, end_frame, dataset_name=None):
+        """Initialize ExportH5Worker to export HDF5 frames to temporary folder."""
         super().__init__()
         self.h5_path = h5_path
         self.start_frame = start_frame
@@ -586,6 +523,7 @@ class ExportH5Worker(QThread):
         print(f"Initialized ExportH5Worker with start_frame={start_frame}, end_frame={end_frame}, dataset_name={dataset_name}")
 
     def run(self):
+        """Export HDF5 frames to temporary folder as JPEG files."""
         try:
             with h5py.File(self.h5_path, 'r') as f:
                 ds_name = self.dataset_name
@@ -661,8 +599,11 @@ class ExportH5Worker(QThread):
             traceback.print_exc()
             self.error.emit(str(e))
 
+# --- Main GUI Application ---
+
 class C_Elegans_GUI(QMainWindow):
     def __init__(self):
+        """Initialize the main GUI window and setup all UI components."""
         super().__init__()
         self.setWindowTitle("C. Elegans Tracker (SAM 2)")
         self.resize(1000, 800)
@@ -726,6 +667,12 @@ class C_Elegans_GUI(QMainWindow):
         self.stacked_widget = QStackedWidget()
         self.setCentralWidget(self.stacked_widget)
 
+        # Setup Menu Bar
+        self.setup_menu_bar()
+
+        # Mask output directory (initialize before setup_tracking_screen)
+        self.save_mask_dir = "/Users/huayinluo/Documents/code/zhenlab/MultiscaleSEM/masks"
+
         self.setup_selection_screen()
         self.setup_tracking_screen()
 
@@ -737,13 +684,151 @@ class C_Elegans_GUI(QMainWindow):
         self._image_loader.set_references(self.image_files, self.tracking_mask_files, gui_instance=self)
         # temp dir used when exporting HDF5 frames for tracking
         self._h5_export_tempdir = None
+        # track HDF5 file path and dataset name
+        self.h5_file_path = None
+        self.h5_dataset_name = None
+        # track TIF temp directory
+        self.tif_temp_dir = None
 
+    # --- Menu Bar Setup ---
+    
+    def setup_menu_bar(self):
+        """Setup the menu bar with File menu and import options."""
+        menubar = self.menuBar()
+        
+        # File menu
+        file_menu = menubar.addMenu('File')
+        
+        # Import New Folder action
+        import_folder_action = QAction('Import New Folder', self)
+        import_folder_action.triggered.connect(self.import_new_folder)
+        file_menu.addAction(import_folder_action)
+        
+        # Import New TIFF action
+        import_tiff_action = QAction('Import New TIFF', self)
+        import_tiff_action.triggered.connect(self.import_new_tiff)
+        file_menu.addAction(import_tiff_action)
+        
+        # Import New HDF5 action
+        import_hdf5_action = QAction('Import New HDF5', self)
+        import_hdf5_action.triggered.connect(self.import_new_hdf5)
+        file_menu.addAction(import_hdf5_action)
+
+    # --- State Management ---
+    
+    def reset_state(self):
+        """Reset all state variables and clean up memory when loading a new video."""
+        # Stop playback if active
+        if self.playing:
+            self.playing = False
+            self.play_timer.stop()
+            if hasattr(self, 'btn_play'):
+                self.btn_play.setText("▶ Play")
+        
+        # Stop any ongoing tracking
+        if hasattr(self, 'tracker_worker') and self.tracker_worker is not None:
+            try:
+                self.tracker_worker.request_stop()
+                self.tracker_worker.wait(2000)  # Wait up to 2 seconds
+                self.tracker_worker = None
+            except Exception:
+                pass
+        
+        # Clean up temporary directories
+        if hasattr(self, 'tif_temp_dir') and self.tif_temp_dir and os.path.exists(self.tif_temp_dir):
+            try:
+                shutil.rmtree(self.tif_temp_dir)
+                self.tif_temp_dir = None
+            except Exception as e:
+                print(f"Warning: Could not remove temp dir {self.tif_temp_dir}: {e}")
+        
+        if hasattr(self, '_h5_export_tempdir') and self._h5_export_tempdir and os.path.exists(self._h5_export_tempdir):
+            try:
+                shutil.rmtree(self._h5_export_tempdir)
+                self._h5_export_tempdir = None
+            except Exception as e:
+                print(f"Warning: Could not remove H5 export temp dir: {e}")
+        
+        # Reset all state variables
+        self.video_path = None
+        self.image_files = []
+        self.current_frame_idx = 0
+        self._last_loaded_rgb = None
+        self._hovered_point = None
+        self.prompts_by_object = {}
+        self.next_object_id = 0
+        self.autoseg_frame_idx = None
+        self.tracking_results = None
+        self.tracking_mask_files = {}
+        self.centerlines = {}
+        self.h5_file_path = None
+        self.h5_dataset_name = None
+        
+        # Clear all caches
+        self._mask_cache = {}
+        self.pixmap_cache = OrderedDict()
+        
+        # Reset UI elements
+        if hasattr(self, 'slider'):
+            self.slider.setValue(0)
+            self.slider.setMaximum(0)
+            self.slider.setEnabled(False)
+        
+        if hasattr(self, 'frame_spinbox'):
+            self.frame_spinbox.setValue(0)
+            self.frame_spinbox.setMaximum(0)
+            self.frame_spinbox.setEnabled(False)
+        
+        if hasattr(self, 'btn_play'):
+            self.btn_play.setEnabled(False)
+        
+        if hasattr(self, 'btn_track'):
+            self.btn_track.setEnabled(True)
+        
+        if hasattr(self, 'status_label'):
+            self.status_label.setText("Ready")
+        
+        # Update image loader to clear references
+        try:
+            self._image_loader.set_references([], {}, gui_instance=self)
+        except Exception:
+            pass
+        
+        # Force garbage collection
+        import gc
+        gc.collect()
+        if self.device.type == 'cuda':
+            torch.cuda.empty_cache()
+        elif self.device.type == 'mps':
+            try:
+                torch.mps.empty_cache()
+            except Exception:
+                pass
+
+    def import_new_folder(self):
+        """Import a new video folder after cleaning up the current state."""
+        self.reset_state()
+        self.choose_folder()
+
+    def import_new_tiff(self):
+        """Import a new TIFF file after cleaning up the current state."""
+        self.reset_state()
+        self.choose_tif()
+
+    def import_new_hdf5(self):
+        """Import a new HDF5 file after cleaning up the current state."""
+        self.reset_state()
+        self.choose_hdf5()
+
+    # --- Screen Setup ---
+    
     def setup_selection_screen(self):
+        """Setup the initial selection screen for choosing video source."""
         self.selection_widget = QWidget()
         layout = QVBoxLayout()
         layout.setAlignment(Qt.AlignCenter)
 
-        label = QLabel("Please select the folder containing your video frames (0.jpg, 1.jpg...)")
+        label = QLabel("Please import a video folder or HDF5/TIF file to begin")
         label.setStyleSheet("font-size: 18px; margin-bottom: 20px;")
         
         btn_select = QPushButton("Select Video Folder")
@@ -765,7 +850,10 @@ class C_Elegans_GUI(QMainWindow):
         self.selection_widget.setLayout(layout)
         self.stacked_widget.addWidget(self.selection_widget)
 
+    # --- File and Data Loading ---
+    
     def choose_hdf5(self):
+        """Open file dialog to select and load an HDF5 file."""
         path, _ = QFileDialog.getOpenFileName(self, "Select HDF5 file", filter="HDF5 Files (*.h5 *.hdf5);;All Files (*)")
         if not path:
             return
@@ -855,6 +943,7 @@ class C_Elegans_GUI(QMainWindow):
             
             # Create a temporary directory to extract frames
             temp_dir = tempfile.mkdtemp(prefix="tif_video_")
+            self.tif_temp_dir = temp_dir  # Track temp dir for cleanup
             
             # Extract frames from TIFF as JPG (required for SAM2 tracker)
             with Image.open(path) as img:
@@ -921,6 +1010,8 @@ class C_Elegans_GUI(QMainWindow):
             QMessageBox.critical(self, "Error", f"Failed to load TIF file: {str(e)}")
             return
 
+    # --- Object and Prompt Management ---
+
     def get_all_object_ids(self):
         """Get sorted list of all object IDs that exist across all frames."""
         return sorted(self.prompts_by_object.keys())
@@ -963,6 +1054,7 @@ class C_Elegans_GUI(QMainWindow):
         return obj_id
 
     def setup_tracking_screen(self):
+        """Setup the main tracking screen with image display and controls."""
         self.tracking_widget = QWidget()
         layout = QVBoxLayout()
 
@@ -1002,6 +1094,23 @@ class C_Elegans_GUI(QMainWindow):
         self.left_layout = QVBoxLayout()
         self.left_layout.setAlignment(Qt.AlignTop)
         self.left_sidebar.setLayout(self.left_layout)
+
+        # Mask output directory row
+        mask_dir_widget = QWidget()
+        mask_dir_layout = QVBoxLayout()
+        mask_dir_layout.setContentsMargins(0, 0, 0, 0)
+        mask_dir_widget.setLayout(mask_dir_layout)
+        mask_dir_layout.addWidget(QLabel("Mask Output Dir:"))
+        self.mask_dir_label = QLabel(self.save_mask_dir)
+        self.mask_dir_label.setWordWrap(True)
+        self.mask_dir_label.setStyleSheet("font-size: 9px; color: #888;")
+        mask_dir_layout.addWidget(self.mask_dir_label)
+        btn_choose_mask_dir = QPushButton("Browse...")
+        btn_choose_mask_dir.setFixedHeight(28)
+        btn_choose_mask_dir.clicked.connect(self.choose_mask_output_dir)
+        mask_dir_layout.addWidget(btn_choose_mask_dir)
+        self.left_layout.addWidget(mask_dir_widget)
+        self.left_layout.addSpacing(10)
 
         self.left_layout.addWidget(QLabel("Tracking Range:"))
         
@@ -1199,7 +1308,20 @@ class C_Elegans_GUI(QMainWindow):
         self.tracking_widget.setLayout(layout)
         self.stacked_widget.addWidget(self.tracking_widget)
 
+    # --- Frame Navigation and Controls ---
+
+    def choose_mask_output_dir(self):
+        """Open dialog to choose mask output directory."""
+        folder = QFileDialog.getExistingDirectory(self, "Select Mask Output Directory", self.save_mask_dir)
+        if folder:
+            self.save_mask_dir = folder
+            self.mask_dir_label.setText(folder)
+            self.status_label.setText(f"Mask output directory set to: {folder}")
+
+    # --- Frame Navigation and Controls ---
+
     def choose_folder(self):
+        """Open directory dialog to select and load a video folder."""
         folder = QFileDialog.getExistingDirectory(self, "Select Video Directory")
         if folder:
             self.video_path = folder
@@ -1249,6 +1371,7 @@ class C_Elegans_GUI(QMainWindow):
                 pass
 
     def on_slider_change(self, value):
+        """Handle frame slider value changes to navigate between frames."""
         self.current_frame_idx = value
         self.frame_label.setText(f"Frame: {value}")
         # Sync spinbox without triggering its valueChanged signal
@@ -1347,12 +1470,14 @@ class C_Elegans_GUI(QMainWindow):
             return resampled
 
     def clear_pixmap_cache(self):
+        """Clear the pixmap cache to force reloading of frames."""
         try:
             self.pixmap_cache.clear()
         except Exception:
             self.pixmap_cache = {}
 
     def run_autosegmentation(self):
+        """Run automatic segmentation to detect worms in the current frame."""
         if not self.image_files:
             return
 
@@ -1497,7 +1622,10 @@ class C_Elegans_GUI(QMainWindow):
             QMessageBox.critical(self, "Error", f"Segmentation failed: {str(e)}")
             self.status_label.setText("Error in segmentation.")
 
+    # --- Tracking Operations ---
+    
     def run_tracking(self):
+        """Start SAM2 tracking on the selected frame range."""
         if not SAM2_AVAILABLE:
             QMessageBox.critical(self, "Error", "SAM 2 library is not installed/importable.")
             return
@@ -1588,7 +1716,7 @@ class C_Elegans_GUI(QMainWindow):
             print(f"Video name for tracker: {video_name}")
             print(f"trackerworker video folder: {video_folder}")
             print(f"trackerworker frame range: {start_frame} to {end_frame}")
-            self.worker = TrackerWorker(video_folder, self.device, prompts, colors=self.colors, model_size=getattr(self, 'model_size', 'base'), start_frame=start_frame, end_frame=end_frame, video_name=video_name, num_centerline_points=self.centerline_points_spin.value())
+            self.worker = TrackerWorker(video_folder, self.device, prompts, colors=self.colors, model_size=getattr(self, 'model_size', 'base'), start_frame=start_frame, end_frame=end_frame, video_name=video_name, num_centerline_points=self.centerline_points_spin.value(), save_mask_dir=self.save_mask_dir)
             self.worker.maskSaved.connect(self._on_mask_saved)
             self.worker.centerlineComputed.connect(self._on_centerline_computed)
             self.worker.finished.connect(self.on_tracking_finished)
@@ -1603,7 +1731,10 @@ class C_Elegans_GUI(QMainWindow):
             self.btn_track.setEnabled(True)
             self.btn_autosegment.setEnabled(True)
 
+    # --- Playback Controls ---
+
     def _prefetch_neighbors(self, idx):
+        """Prefetch frames around the given index for smoother navigation."""
         # Request loading of current frame and neighbors
         start = max(0, idx - self.prefetch_radius)
         end = min(self.slider.maximum(), idx + self.prefetch_radius)
@@ -1612,6 +1743,7 @@ class C_Elegans_GUI(QMainWindow):
                 self._image_loader.request(i)
 
     def _on_frame_loaded(self, idx, img_rgb):
+        """Handle frame loaded signal from background loader thread."""
         # Called in GUI thread when image loader has RGB numpy image ready
         try:
             img_rgb = np.ascontiguousarray(img_rgb)
@@ -1757,6 +1889,7 @@ class C_Elegans_GUI(QMainWindow):
         except Exception:
             pass
 
+    
     def toggle_play(self):
         """Toggle playback: start or stop the play timer."""
         if not self.slider.isEnabled():
@@ -1811,9 +1944,11 @@ class C_Elegans_GUI(QMainWindow):
             # pass other keys to base class
             super().keyPressEvent(event)
 
+    # --- Tracking Callbacks ---
+    
     def _on_mask_saved(self, frame_idx, mask_path):
         """Called when a single mask is saved during tracking.
-        Update mask index and display if on that frame.
+        Update mask index and navigate to the frame to show the new mask.
         """
         try:
             # Add to mask index
@@ -1908,7 +2043,10 @@ class C_Elegans_GUI(QMainWindow):
 
         self.update_display()
 
+    # --- Event Handling ---
+    
     def eventFilter(self, obj, event):
+        """Handle mouse events on the image label for prompt interaction."""
         # handle hover and clicks on the image label
         try:
             if obj == self.image_label:
@@ -2134,7 +2272,10 @@ class C_Elegans_GUI(QMainWindow):
             pass
         return super().eventFilter(obj, event)
 
+    # --- Cleanup ---
+    
     def closeEvent(self, event):
+        """Clean up resources and stop background threads when closing the application."""
         # Stop background threads cleanly
         try:
             if hasattr(self, '_image_loader') and self._image_loader is not None:
@@ -2159,7 +2300,10 @@ class C_Elegans_GUI(QMainWindow):
             pass
         super().closeEvent(event)
 
+    # --- Error Handling ---
+    
     def on_tracking_error(self, err_msg):
+        """Handle tracking errors and display error message."""
         QMessageBox.critical(self, "Tracking Error", err_msg)
         self.status_label.setText("Tracking Failed.")
         self.btn_track.setEnabled(True)
@@ -2169,6 +2313,8 @@ class C_Elegans_GUI(QMainWindow):
         except Exception:
             pass
 
+    # --- HDF5 Export Callbacks ---
+    
     def _on_h5_export_finished(self, temp_folder):
         """Called when ExportH5Worker finishes exporting frames to `temp_folder`."""
         try:
@@ -2207,6 +2353,8 @@ class C_Elegans_GUI(QMainWindow):
             QMessageBox.critical(self, "Error", f"Failed to start tracker after HDF5 stream ready: {e}")
             self.btn_track.setEnabled(True)
             self.btn_autosegment.setEnabled(True)
+
+    # --- Object Sidebar Management ---
 
     def clear_layout(self, layout):
         """Remove all widgets from a layout."""
@@ -2420,7 +2568,10 @@ class C_Elegans_GUI(QMainWindow):
             QMessageBox.critical(self, "Error", f"Failed to delete object: {e}")
             print(f"delete_object error: {e}")
 
+    # --- Display and Rendering ---
+    
     def update_display(self):
+        """Update the display to show the current frame."""
         # allow HDF5-backed datasets as well as file lists
         if not self.image_files and not getattr(self, 'h5_file_path', None):
             return
