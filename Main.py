@@ -101,9 +101,9 @@ class TrackerWorker(QThread):
     maskSaved = pyqtSignal(int, str) # Emits (frame_idx, mask_file_path) when mask is saved
     centerlineComputed = pyqtSignal(int, dict) # Emits (frame_idx, {obj_id: centerline_points})
 
-    def __init__(self, video_path, device, scaled_blob_centers, colors=None, model_size='base', start_frame=0, end_frame=None, video_name=None, num_centerline_points=100, save_mask_dir=None):
+    def __init__(self, video_path, device, scaled_blob_centers, colors=None, model_size='base', start_frame=0, end_frame=None, video_name=None, num_centerline_points=100, save_mask_dir="./masks"):
         super().__init__()
-        self.save_mask_dir = save_mask_dir or "/Users/huayinluo/Documents/code/zhenlab/MultiscaleSEM/masks"
+        self.save_mask_dir = save_mask_dir
         self.video_path = video_path
         self.device = device
         self.scaled_blob_centers = scaled_blob_centers
@@ -144,11 +144,13 @@ class TrackerWorker(QThread):
         """
         try:
             # 1. Setup Folders
-            video_dir_name = os.path.basename(os.path.normpath(self.video_path))
             parent_dir = os.path.dirname(os.path.normpath(self.video_path))
             ts = datetime.now().strftime("%Y%m%d_%H%M%S")
+            video_name = os.path.basename(os.path.normpath(self.video_path))
             print(f"Chosen save_mask_dir: {self.save_mask_dir}")
-            mask_output_dir = os.path.join(self.save_mask_dir, f"{self.video_name}_masks_{ts}")
+            print(f"Video name: {video_name}")
+
+            mask_output_dir = os.path.join(self.save_mask_dir, f"{video_name}_masks_{ts}_{self.start_frame}_{self.end_frame if self.end_frame is not None else 'end'}")
             os.makedirs(mask_output_dir, exist_ok=True)
             print(f"Initialized mask output directory at: {mask_output_dir}")
 
@@ -319,26 +321,6 @@ class ImageLoader(QThread):
                 self._req_q.put(idx)
             except Exception:
                 pass
-                try:
-                    if hasattr(self, '_realtime_worker') and getattr(self, '_realtime_worker') is not None:
-                        if getattr(self._realtime_worker, '_paused', False):
-                            # resume
-                            try:
-                                self._realtime_worker.resume()
-                                self.btn_pause_realtime.setText("Pause Tracking")
-                                self.status_label.setText("Real-time tracking: resumed")
-                            except Exception:
-                                pass
-                        else:
-                            # pause
-                            try:
-                                self._realtime_worker.pause()
-                                self.btn_pause_realtime.setText("Resume Tracking")
-                                self.status_label.setText("Real-time tracking: paused")
-                            except Exception:
-                                pass
-                except Exception:
-                    pass
 
     def run(self):
         while self._running:
@@ -546,130 +528,6 @@ class ExportH5Worker(QThread):
             traceback.print_exc()
             self.error.emit(str(e))
 
-class RealTimeTrackerWorker(QThread):
-    """Tracker that emits masks per-frame so GUI can display them in real time.
-    Signals:
-      frameMask(int, np.ndarray): emits (frame_idx, color_mask_bgr)
-      finished(str): emits mask folder path when done
-      error(str)
-    Supports pause()/resume()/stop().
-    """
-    frameMask = pyqtSignal(int, object)
-    finished = pyqtSignal(str)
-    error = pyqtSignal(str)
-
-    def __init__(self, video_path, device, scaled_blob_centers, colors=None, model_size='base', start_frame=0, end_frame=None):
-        super().__init__()
-        self.video_path = video_path
-        self.device = device
-        self.scaled_blob_centers = scaled_blob_centers
-        self.model_size = model_size
-        self._running = True
-        self._paused = False
-        self.start_frame = int(start_frame) if start_frame is not None else 0
-        self.end_frame = int(end_frame) if end_frame is not None else None
-        if colors is None:
-            self.colors = np.random.randint(0, 255, (100, 3), dtype=np.uint8)
-        else:
-            self.colors = colors
-
-    def pause(self):
-        self._paused = True
-
-    def resume(self):
-        self._paused = False
-
-    def stop(self):
-        self._running = False
-
-    def run(self):
-        try:
-            # similar init to TrackerWorker
-            video_dir_name = os.path.basename(os.path.normpath(self.video_path))
-            parent_dir = os.path.dirname(os.path.normpath(self.video_path))
-            mask_output_dir = os.path.join(parent_dir, f"{video_dir_name}_masks")
-            os.makedirs(mask_output_dir, exist_ok=True)
-
-            model_size = getattr(self, 'model_size', 'base')
-            if model_size == 'tiny':
-                sam2_checkpoint = "./checkpoints/sam2.1_hiera_tiny.pt"
-                model_cfg = "configs/sam2.1/sam2.1_hiera_t.yaml"
-            elif model_size == 'base':
-                sam2_checkpoint = "./checkpoints/sam2.1_hiera_base_plus.pt"
-                model_cfg = "configs/sam2.1/sam2.1_hiera_b+.yaml"
-            elif model_size == 'large':
-                sam2_checkpoint = "./checkpoints/sam2.1_hiera_large.pt"
-                model_cfg = "configs/sam2.1/sam2.1_hiera_l.yaml"
-            else:
-                self.error.emit(f"Unknown model size: {model_size}")
-                return
-
-            if not os.path.exists(sam2_checkpoint):
-                self.error.emit(f"Checkpoint not found: {sam2_checkpoint}")
-                return
-
-            # initialize predictor with video path
-            predictor = build_sam2_video_predictor(model_cfg, sam2_checkpoint, device=self.device)
-            inference_state = predictor.init_state(video_path=self.video_path)
-            for i, prompts in enumerate(self.scaled_blob_centers):
-                if not prompts:
-                    continue
-                ann_obj_id = i + 1
-                # prompts is a list of ((x, y), label) tuples
-                points = np.array([pt for pt, _ in prompts], dtype=np.float32)
-                labels = np.array([lbl for _, lbl in prompts], dtype=np.int32)
-                predictor.add_new_points_or_box(
-                    inference_state=inference_state,
-                    frame_idx=0,
-                    obj_id=ann_obj_id,
-                    points=points,
-                    labels=labels,
-                )
-            first_frame_path = os.path.join(self.video_path, sorted(os.listdir(self.video_path))[0])
-            ref_img = cv2.imread(first_frame_path)
-            h, w = ref_img.shape[:2]
-
-            for out_frame_idx, out_obj_ids, out_mask_logits in predictor.propagate_in_video(inference_state):
-                if not self._running:
-                    break
-                # respect pause
-                while self._paused and self._running:
-                    QThread.msleep(100)
-
-                # assemble color mask
-                color_mask = np.zeros((h, w, 3), dtype=np.uint8)
-                for i, out_obj_id in enumerate(out_obj_ids):
-                    mask = (out_mask_logits[i] > 0.0).cpu().numpy().squeeze()
-                    if mask.sum() > 0:
-                        if mask.shape != (h, w):
-                            mask = cv2.resize(mask.astype(np.uint8), (w, h), interpolation=cv2.INTER_NEAREST)
-                        color = self.colors[out_obj_id % len(self.colors)]
-                        color_mask[mask > 0] = color
-
-                # emit for GUI to display (only if within range)
-                if out_frame_idx >= self.start_frame and (self.end_frame is None or out_frame_idx <= self.end_frame):
-                    try:
-                        self.frameMask.emit(out_frame_idx, color_mask.copy())
-                    except Exception:
-                        pass
-                    # save mask
-                    save_path = os.path.join(mask_output_dir, f"{out_frame_idx}.jpg")
-                    try:
-                        cv2.imwrite(save_path, color_mask, [int(cv2.IMWRITE_JPEG_QUALITY), 90])
-                    except Exception:
-                        pass
-
-                # stop early if we've passed end_frame
-                if self.end_frame is not None and out_frame_idx > self.end_frame:
-                    break
-
-            # finished
-            self.finished.emit(mask_output_dir)
-        except Exception as e:
-            import traceback
-            traceback.print_exc()
-            self.error.emit(str(e))
-
 class C_Elegans_GUI(QMainWindow):
     def __init__(self):
         super().__init__()
@@ -719,6 +577,11 @@ class C_Elegans_GUI(QMainWindow):
 
         # Mask output directory (can be changed via sidebar)
         self.save_mask_dir = "/Users/huayinluo/Documents/code/zhenlab/MultiscaleSEM/masks"
+        # Parent directory of current video (for optional use as mask output)
+        self.video_parent_dir = None
+        # Whether to use parent dir for masks instead of save_mask_dir
+        self.use_parent_dir_for_masks = False
+
 
         # Setup Device
         if torch.cuda.is_available():
@@ -768,13 +631,6 @@ class C_Elegans_GUI(QMainWindow):
                 self.worker.request_stop()
                 self.worker.wait(2000)
                 self.worker = None
-        except Exception:
-            pass
-        try:
-            if hasattr(self, '_realtime_worker') and getattr(self, '_realtime_worker', None) is not None and self._realtime_worker.isRunning():
-                self._realtime_worker.stop()
-                self._realtime_worker.wait(2000)
-                self._realtime_worker = None
         except Exception:
             pass
 
@@ -829,8 +685,6 @@ class C_Elegans_GUI(QMainWindow):
         try:
             self.btn_play.setEnabled(False)
             self.btn_track.setEnabled(False)
-            self.btn_track_realtime.setEnabled(False)
-            self.btn_pause_realtime.setEnabled(False)
             self.btn_autosegment.setEnabled(True)
             self.btn_stop.setEnabled(False)
         except Exception:
@@ -936,6 +790,10 @@ class C_Elegans_GUI(QMainWindow):
         self.image_files = None
         self.h5_file_path = path
         self.h5_dataset_name = ds_name
+        
+        # Set parent directory for optional use as mask output
+        self.video_parent_dir = os.path.dirname(os.path.normpath(path))
+        self._update_parent_dir_label()
 
         # configure slider and UI
         self.slider.setMaximum(max(0, n_frames - 1))
@@ -1071,6 +929,20 @@ class C_Elegans_GUI(QMainWindow):
         btn_choose_mask_dir.setFixedHeight(28)
         btn_choose_mask_dir.clicked.connect(self.choose_mask_output_dir)
         mask_dir_layout.addWidget(btn_choose_mask_dir)
+        
+        # Checkbox to use parent directory
+        parent_dir_checkbox_layout = QHBoxLayout()
+        parent_dir_checkbox_layout.setContentsMargins(0, 0, 0, 0)
+        self.use_parent_dir_checkbox = QCheckBox()
+        self.use_parent_dir_checkbox.setChecked(False)
+        self.use_parent_dir_checkbox.stateChanged.connect(self._on_use_parent_dir_changed)
+        parent_dir_checkbox_layout.addWidget(self.use_parent_dir_checkbox)
+        self.parent_dir_label_text = QLabel("use parent dir: (no video loaded)")
+        self.parent_dir_label_text.setWordWrap(True)
+        self.parent_dir_label_text.setStyleSheet("font-size: 9px;")
+        parent_dir_checkbox_layout.addWidget(self.parent_dir_label_text)
+        mask_dir_layout.addLayout(parent_dir_checkbox_layout)
+        
         self.left_layout.addWidget(mask_dir_widget)
         self.left_layout.addSpacing(10)
 
@@ -1169,15 +1041,6 @@ class C_Elegans_GUI(QMainWindow):
         self.btn_track.clicked.connect(self.run_tracking)
         self.btn_track.setEnabled(False) # Disabled until autosegment is done
 
-        # Real-time tracking buttons
-        self.btn_track_realtime = QPushButton("Track in Real Time")
-        self.btn_track_realtime.clicked.connect(self.run_tracking_realtime)
-        self.btn_track_realtime.setEnabled(False)
-
-        self.btn_pause_realtime = QPushButton("Pause Tracking")
-        self.btn_pause_realtime.setEnabled(False)
-        self.btn_pause_realtime.clicked.connect(self.toggle_realtime_pause)
-
         self.btn_stop = QPushButton("Stop Tracking")
         self.btn_stop.setEnabled(False)
         self.btn_stop.clicked.connect(self.stop_tracking)
@@ -1186,8 +1049,6 @@ class C_Elegans_GUI(QMainWindow):
         self.left_layout.addSpacing(10)
         self.left_layout.addWidget(self.btn_autosegment)
         self.left_layout.addWidget(self.btn_track)
-        self.left_layout.addWidget(self.btn_track_realtime)
-        self.left_layout.addWidget(self.btn_pause_realtime)
         self.left_layout.addWidget(self.btn_stop)
 
         # Create vertical opacity slider
@@ -1255,12 +1116,6 @@ class C_Elegans_GUI(QMainWindow):
 
         layout.addLayout(controls_layout)
 
-        # btn_layout.addWidget(self.btn_autosegment)
-        # btn_layout.addWidget(self.btn_track)
-        # btn_layout.addWidget(self.btn_track_realtime)
-        # btn_layout.addWidget(self.btn_pause_realtime)
-        # layout.addLayout(btn_layout)
-
         # Status Bar / Progress
         self.status_label = QLabel("Ready")
         layout.addWidget(self.status_label)
@@ -1280,6 +1135,10 @@ class C_Elegans_GUI(QMainWindow):
             self._reset_state_for_new_video()
 
             self.video_path = folder
+            # Set parent directory for optional use as mask output
+            self.video_parent_dir = os.path.dirname(os.path.normpath(folder))
+            self._update_parent_dir_label()
+            
             # Load images
             files = [f for f in os.listdir(folder) if f.lower().endswith(('.jpg', '.png', '.jpeg'))]
             # Try to sort numerically if filenames are integers
@@ -1621,108 +1480,12 @@ class C_Elegans_GUI(QMainWindow):
             if hasattr(self, 'worker') and self.worker is not None and self.worker.isRunning():
                 self.worker.request_stop()
                 self.status_label.setText("Stop requested... finishing current frame.")
-            if hasattr(self, '_realtime_worker') and getattr(self, '_realtime_worker', None) is not None:
-                try:
-                    self._realtime_worker.stop()
-                except Exception:
-                    pass
             try:
                 self.btn_stop.setEnabled(False)
             except Exception:
                 pass
         except Exception:
             pass
-
-    def run_tracking_realtime(self):
-        """Start real-time tracking: export HDF5 if needed, otherwise start realtime worker on folder."""
-        if not SAM2_AVAILABLE:
-            QMessageBox.critical(self, "Error", "SAM 2 library is not installed/importable.")
-            return
-
-        # if HDF5 source, export first
-        if getattr(self, 'h5_file_path', None) is not None:
-            # check that prompts exist for requested start frame before exporting
-            try:
-                start_frame = int(self.start_spin.value()) if hasattr(self, 'start_spin') else 0
-            except Exception:
-                start_frame = 0
-            start_frame_has_prompts = any(
-                len(self.get_prompts_for_object_in_frame(obj_id, start_frame)) > 0 
-                for obj_id in self.get_all_object_ids()
-            )
-            if not start_frame_has_prompts:
-                QMessageBox.critical(self, "Error", "No prompts for chosen start frame. Please add some prompts.")
-                return
-            try:
-                self.btn_track_realtime.setEnabled(False)
-                self.btn_autosegment.setEnabled(False)
-                self.status_label.setText("Exporting HDF5 frames to temporary folder for real-time tracking...")
-                self._export_worker = ExportH5Worker(self.h5_file_path, getattr(self, 'h5_dataset_name', None))
-                self._export_worker.stream_mode = False
-                self._export_worker.progress.connect(lambda p: self.status_label.setText(f"Exporting frames... {p}%"))
-                self._export_worker.ready.connect(self._on_h5_export_finished_realtime)
-                self._export_worker.finished.connect(self.on_tracking_finished)
-                self._export_worker.error.connect(self.on_tracking_error)
-                self._export_worker.start()
-                return
-            except Exception as e:
-                QMessageBox.critical(self, "Error", f"Failed to start HDF5 export: {e}")
-                return
-
-        # determine requested frame range from spinboxes (if present)
-        try:
-            start_frame = int(self.start_spin.value()) if hasattr(self, 'start_spin') else 0
-            end_frame = int(self.end_spin.value()) if hasattr(self, 'end_spin') else None
-        except Exception:
-            start_frame = 0
-            end_frame = None
-
-        # start realtime on folder
-        self._start_realtime_worker(self.video_path, start_frame=start_frame, end_frame=end_frame)
-
-    def _on_h5_export_finished_realtime(self, temp_folder):
-        # save export tempdir so cleanup happens later
-        self._h5_export_tempdir = temp_folder
-        # get requested start/end
-        try:
-            start_frame = int(self.start_spin.value()) if hasattr(self, 'start_spin') else 0
-            end_frame = int(self.end_spin.value()) if hasattr(self, 'end_spin') else None
-        except Exception:
-            start_frame = 0
-            end_frame = None
-        self._start_realtime_worker(temp_folder, start_frame=start_frame, end_frame=end_frame)
-
-    def _start_realtime_worker(self, video_folder, start_frame=0, end_frame=None):
-        try:
-            self.btn_track_realtime.setEnabled(False)
-            self.btn_pause_realtime.setEnabled(True)
-            self.btn_track.setEnabled(False)
-            self.btn_autosegment.setEnabled(False)
-            self.status_label.setText("Real-time tracking...")
-            # fetch prompts for the requested start frame for all objects
-            prompts = self.get_prompts_for_frame(start_frame)
-            if not any(prompts):  # Check if any object has prompts
-                QMessageBox.critical(self, "Error", "No prompts for chosen start frame. Please add some prompts.")
-                # re-enable UI
-                self.btn_track_realtime.setEnabled(True)
-                self.btn_pause_realtime.setEnabled(False)
-                self.btn_autosegment.setEnabled(True)
-                return
-
-            self._realtime_worker = RealTimeTrackerWorker(video_folder, self.device, prompts, colors=self.colors, model_size=getattr(self, 'model_size', 'base'), start_frame=start_frame, end_frame=end_frame)
-            self._realtime_worker.frameMask.connect(self._on_realtime_frame)
-            self._realtime_worker.finished.connect(self.on_tracking_finished)
-            self._realtime_worker.error.connect(self.on_tracking_error)
-            self._realtime_worker.start()
-            try:
-                self.btn_stop.setEnabled(True)
-            except Exception:
-                pass
-        except Exception as e:
-            QMessageBox.critical(self, "Error", f"Failed to start realtime tracker: {e}")
-            self.btn_track_realtime.setEnabled(True)
-            self.btn_pause_realtime.setEnabled(False)
-            self.btn_autosegment.setEnabled(True)
 
     def _start_tracker_worker(self, video_folder, start_frame=0, end_frame=None):
         """Start the TrackerWorker using the given video_folder path."""
@@ -1743,6 +1506,13 @@ class C_Elegans_GUI(QMainWindow):
             print(f"Video name for tracker: {video_name}")
             print(f"trackerworker video folder: {video_folder}")
             print(f"trackerworker frame range: {start_frame} to {end_frame}")
+            
+            # Determine which mask output directory to use
+            mask_output_dir = self.save_mask_dir
+            if self.use_parent_dir_for_masks and self.video_parent_dir:
+                mask_output_dir = self.video_parent_dir
+                print(f"Using parent directory for masks: {mask_output_dir}")
+            
             self.worker = TrackerWorker(
                 video_folder,
                 self.device,
@@ -1753,7 +1523,7 @@ class C_Elegans_GUI(QMainWindow):
                 end_frame=end_frame,
                 video_name=video_name,
                 num_centerline_points=self.centerline_points_spin.value(),
-                save_mask_dir=self.save_mask_dir,
+                save_mask_dir=mask_output_dir,
             )
             self.worker.maskSaved.connect(self._on_mask_saved)
             self.worker.centerlineComputed.connect(self._on_centerline_computed)
@@ -1789,6 +1559,18 @@ class C_Elegans_GUI(QMainWindow):
                 self.status_label.setText(f"Mask output directory set to: {folder}")
             except Exception:
                 pass
+
+    def _update_parent_dir_label(self):
+        """Update the parent directory label when a video is loaded."""
+        if self.video_parent_dir:
+            parent_dir_name = os.path.basename(self.video_parent_dir)
+            self.parent_dir_label_text.setText(f"use parent dir: {parent_dir_name}")
+        else:
+            self.parent_dir_label_text.setText("use parent dir: (no video loaded)")
+
+    def _on_use_parent_dir_changed(self, state):
+        """Handle checkbox state changes for using parent directory."""
+        self.use_parent_dir_for_masks = (state == Qt.Checked)
 
     def _on_frame_loaded(self, idx, img_rgb):
         # Called in GUI thread when image loader has RGB numpy image ready
@@ -2095,87 +1877,6 @@ class C_Elegans_GUI(QMainWindow):
 
         self.update_display()
 
-    def _on_realtime_frame(self, idx, color_mask_bgr):
-        """Receive per-frame color mask from realtime worker and display it immediately."""
-        try:
-            # read base image for this frame (folder-backed)
-            if self.image_files:
-                img_path = self.image_files[idx]
-                img = cv2.imread(img_path)
-            elif getattr(self, 'h5_file_path', None) and H5PY_AVAILABLE:
-                # load from HDF5 directly for display
-                try:
-                    with h5py.File(self.h5_file_path, 'r') as f:
-                        ds = self.h5_dataset_name if getattr(self, 'h5_dataset_name', None) is not None else next(iter(f.keys()))
-                        arr = np.asarray(f[ds][idx])
-                        if arr.ndim == 2:
-                            img = cv2.cvtColor(arr.astype(np.uint8), cv2.COLOR_GRAY2BGR)
-                        else:
-                            if arr.dtype != np.uint8:
-                                m = arr.max() if arr.max() != 0 else 1.0
-                                img = (255.0 * (arr.astype(np.float32) / m)).astype(np.uint8)
-                            else:
-                                img = arr.astype(np.uint8)
-                            if img.shape[2] == 3:
-                                # assume RGB in HDF5
-                                img = cv2.cvtColor(img, cv2.COLOR_RGB2BGR)
-                except Exception:
-                    return
-            else:
-                return
-
-            if img is None:
-                return
-
-            # compose color mask onto image (both BGR)
-            mask = color_mask_bgr
-            if mask.shape[:2] != img.shape[:2]:
-                mask = cv2.resize(mask, (img.shape[1], img.shape[0]), interpolation=cv2.INTER_NEAREST)
-            mask_indices = np.any(mask != [0, 0, 0], axis=-1)
-            composed = img.copy()
-            # Use dynamic opacity from slider
-            opacity = getattr(self, 'mask_opacity', 0.5)
-            composed[mask_indices] = cv2.addWeighted(composed[mask_indices], 1.0 - opacity, mask[mask_indices], opacity, 0)
-
-            # convert to RGB and display
-            img_rgb = cv2.cvtColor(composed, cv2.COLOR_BGR2RGB)
-            img_rgb = np.ascontiguousarray(img_rgb)
-            h, w, ch = img_rgb.shape
-            bytes_per_line = ch * w
-            q_img = QImage(img_rgb.data, w, h, bytes_per_line, QImage.Format_RGB888)
-            pixmap = QPixmap.fromImage(q_img)
-            scaled = pixmap.scaled(self.image_label.size(), Qt.KeepAspectRatio, Qt.SmoothTransformation)
-
-            # cache it (LRU)
-            try:
-                if len(self.pixmap_cache) >= self.pixmap_cache_max:
-                    try:
-                        self.pixmap_cache.popitem(last=False)
-                    except Exception:
-                        first_key = next(iter(self.pixmap_cache))
-                        self.pixmap_cache.pop(first_key, None)
-                self.pixmap_cache[idx] = scaled
-                try:
-                    self.pixmap_cache.move_to_end(idx, last=True)
-                except Exception:
-                    pass
-            except Exception:
-                self.pixmap_cache[idx] = scaled
-
-            # display and advance slider
-            self.current_frame_idx = idx
-            try:
-                self.image_label.setPixmap(scaled)
-            except Exception:
-                pass
-            try:
-                # update slider without causing heavy prefetch churn
-                self.slider.setValue(idx)
-            except Exception:
-                pass
-        except Exception:
-            pass
-
     def eventFilter(self, obj, event):
         # handle hover and clicks on the image label
         try:
@@ -2417,19 +2118,6 @@ class C_Elegans_GUI(QMainWindow):
                     pass
         except Exception:
             pass
-        # Stop realtime worker if running
-        try:
-            if hasattr(self, '_realtime_worker') and getattr(self, '_realtime_worker') is not None:
-                try:
-                    try:
-                        self._realtime_worker.stop()
-                    except Exception:
-                        pass
-                    self._realtime_worker.wait(1000)
-                except Exception:
-                    pass
-        except Exception:
-            pass
         # remove temporary exported HDF5 frames if present
         try:
             if getattr(self, '_h5_export_tempdir', None):
@@ -2506,43 +2194,6 @@ class C_Elegans_GUI(QMainWindow):
                 child_layout = item.layout()
                 if child_layout is not None:
                     self.clear_layout(child_layout)
-
-
-    def toggle_realtime_pause(self):
-        """Toggle pause/resume of the realtime tracker worker."""
-        try:
-            worker = getattr(self, '_realtime_worker', None)
-            if worker is None:
-                return
-            if getattr(worker, '_paused', False):
-                try:
-                    worker.resume()
-                    self.btn_pause_realtime.setText("Pause Tracking")
-                    self.status_label.setText("Real-time tracking: resumed")
-                except Exception:
-                    pass
-            else:
-                try:
-                    worker.pause()
-                    self.btn_pause_realtime.setText("Resume Tracking")
-                    self.status_label.setText("Real-time tracking: paused")
-                except Exception:
-                    pass
-        except Exception:
-            pass
-        # close any open HDF5 handle
-        try:
-            if getattr(self, '_h5f', None) is not None:
-                try:
-                    self._h5f.close()
-                except Exception:
-                    pass
-                self._h5f = None
-        except Exception:
-            pass
-        self.wait()
-
-
 
     # overlay helper was removed per user request
 
@@ -2627,10 +2278,6 @@ class C_Elegans_GUI(QMainWindow):
             has_objects = len(self.get_all_object_ids()) > 0
             try:
                 self.btn_track.setEnabled(has_objects)
-            except Exception:
-                pass
-            try:
-                self.btn_track_realtime.setEnabled(has_objects)
             except Exception:
                 pass
         except Exception:
