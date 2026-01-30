@@ -16,7 +16,7 @@ except Exception:
     H5PY_AVAILABLE = False
 from PyQt5.QtWidgets import (QApplication, QMainWindow, QWidget, QVBoxLayout, 
                              QHBoxLayout, QPushButton, QLabel, QFileDialog, 
-                             QStackedWidget, QSlider, QMessageBox, QProgressBar, QComboBox, QScrollArea, QSpinBox, QCheckBox)
+                             QStackedWidget, QSlider, QMessageBox, QProgressBar, QComboBox, QScrollArea, QSpinBox, QCheckBox, QAction)
 from PyQt5.QtCore import Qt, QThread, pyqtSignal, QTimer, QEvent
 from PyQt5.QtGui import QImage, QPixmap, QPainter, QColor, QPen, QFont
 from queue import Queue, Empty
@@ -101,9 +101,9 @@ class TrackerWorker(QThread):
     maskSaved = pyqtSignal(int, str) # Emits (frame_idx, mask_file_path) when mask is saved
     centerlineComputed = pyqtSignal(int, dict) # Emits (frame_idx, {obj_id: centerline_points})
 
-    def __init__(self, video_path, device, scaled_blob_centers, colors=None, model_size='base', start_frame=0, end_frame=None, video_name=None, num_centerline_points=100):
+    def __init__(self, video_path, device, scaled_blob_centers, colors=None, model_size='base', start_frame=0, end_frame=None, video_name=None, num_centerline_points=100, save_mask_dir=None):
         super().__init__()
-        self.save_mask_dir = "/Users/huayinluo/Documents/code/zhenlab/MultiscaleSEM/masks"
+        self.save_mask_dir = save_mask_dir or "/Users/huayinluo/Documents/code/zhenlab/MultiscaleSEM/masks"
         self.video_path = video_path
         self.device = device
         self.scaled_blob_centers = scaled_blob_centers
@@ -147,6 +147,7 @@ class TrackerWorker(QThread):
             video_dir_name = os.path.basename(os.path.normpath(self.video_path))
             parent_dir = os.path.dirname(os.path.normpath(self.video_path))
             ts = datetime.now().strftime("%Y%m%d_%H%M%S")
+            print(f"Chosen save_mask_dir: {self.save_mask_dir}")
             mask_output_dir = os.path.join(self.save_mask_dir, f"{self.video_name}_masks_{ts}")
             os.makedirs(mask_output_dir, exist_ok=True)
             print(f"Initialized mask output directory at: {mask_output_dir}")
@@ -716,6 +717,9 @@ class C_Elegans_GUI(QMainWindow):
         # Ensure main window can receive keyboard events
         self.setFocusPolicy(Qt.StrongFocus)
 
+        # Mask output directory (can be changed via sidebar)
+        self.save_mask_dir = "/Users/huayinluo/Documents/code/zhenlab/MultiscaleSEM/masks"
+
         # Setup Device
         if torch.cuda.is_available():
             self.device = torch.device("cuda")
@@ -732,6 +736,9 @@ class C_Elegans_GUI(QMainWindow):
         self.stacked_widget = QStackedWidget()
         self.setCentralWidget(self.stacked_widget)
 
+        # Menu Bar
+        self.setup_menu_bar()
+
         self.setup_selection_screen()
         self.setup_tracking_screen()
 
@@ -743,6 +750,130 @@ class C_Elegans_GUI(QMainWindow):
         self._image_loader.set_references(self.image_files, self.tracking_mask_files, gui_instance=self)
         # temp dir used when exporting HDF5 frames for tracking
         self._h5_export_tempdir = None
+
+    def _reset_state_for_new_video(self):
+        """Clear all UI state, caches, and loader refs before loading a new source."""
+        # stop playback
+        if self.playing:
+            self.play_timer.stop()
+            self.playing = False
+            try:
+                self.btn_play.setText("Play")
+            except Exception:
+                pass
+
+        # stop tracker workers
+        try:
+            if hasattr(self, 'worker') and self.worker is not None and self.worker.isRunning():
+                self.worker.request_stop()
+                self.worker.wait(2000)
+                self.worker = None
+        except Exception:
+            pass
+        try:
+            if hasattr(self, '_realtime_worker') and getattr(self, '_realtime_worker', None) is not None and self._realtime_worker.isRunning():
+                self._realtime_worker.stop()
+                self._realtime_worker.wait(2000)
+                self._realtime_worker = None
+        except Exception:
+            pass
+
+        # clear temp dirs
+        try:
+            if getattr(self, 'tif_temp_dir', None) and os.path.exists(self.tif_temp_dir):
+                shutil.rmtree(self.tif_temp_dir)
+        except Exception:
+            pass
+        self.tif_temp_dir = None
+        try:
+            if getattr(self, '_h5_export_tempdir', None) and os.path.exists(self._h5_export_tempdir):
+                shutil.rmtree(self._h5_export_tempdir)
+        except Exception:
+            pass
+        self._h5_export_tempdir = None
+
+        # reset state vars
+        self.video_path = None
+        self.image_files = []
+        self.h5_file_path = None
+        self.h5_dataset_name = None
+        self.current_frame_idx = 0
+        self._last_loaded_rgb = None
+        self.prompts_by_object = {}
+        self.next_object_id = 0
+        self.autoseg_frame_idx = None
+        self.tracking_results = None
+        self.tracking_mask_files = {}
+        self.centerlines = {}
+
+        # clear caches
+        self._mask_cache = {}
+        try:
+            self.pixmap_cache.clear()
+        except Exception:
+            self.pixmap_cache = OrderedDict()
+
+        # reset UI widgets
+        try:
+            self.slider.setValue(0)
+            self.slider.setMaximum(0)
+            self.slider.setEnabled(False)
+        except Exception:
+            pass
+        try:
+            self.frame_spinbox.setValue(0)
+            self.frame_spinbox.setMaximum(0)
+            self.frame_spinbox.setEnabled(False)
+        except Exception:
+            pass
+        try:
+            self.btn_play.setEnabled(False)
+            self.btn_track.setEnabled(False)
+            self.btn_track_realtime.setEnabled(False)
+            self.btn_pause_realtime.setEnabled(False)
+            self.btn_autosegment.setEnabled(True)
+            self.btn_stop.setEnabled(False)
+        except Exception:
+            pass
+        try:
+            self.status_label.setText("Ready")
+        except Exception:
+            pass
+
+        # update loader references and close any open HDF5 handle in loader thread
+        try:
+            self._image_loader.set_references([], {}, gui_instance=self)
+            if getattr(self._image_loader, '_h5f', None) is not None:
+                try:
+                    self._image_loader._h5f.close()
+                except Exception:
+                    pass
+                self._image_loader._h5f = None
+        except Exception:
+            pass
+
+        # force GC and free device cache if possible
+        try:
+            gc.collect()
+            if self.device.type == 'cuda':
+                torch.cuda.empty_cache()
+            elif self.device.type == 'mps':
+                torch.mps.empty_cache()
+        except Exception:
+            pass
+
+    def setup_menu_bar(self):
+        """Build the menu bar with import options."""
+        menubar = self.menuBar()
+        file_menu = menubar.addMenu("File")
+
+        import_folder_action = QAction("Import Folder", self)
+        import_folder_action.triggered.connect(self.choose_folder)
+        file_menu.addAction(import_folder_action)
+
+        import_h5_action = QAction("Import HDF5", self)
+        import_h5_action.triggered.connect(self.choose_hdf5)
+        file_menu.addAction(import_h5_action)
 
     def setup_selection_screen(self):
         self.selection_widget = QWidget()
@@ -773,6 +904,9 @@ class C_Elegans_GUI(QMainWindow):
         path, _ = QFileDialog.getOpenFileName(self, "Select HDF5 file", filter="HDF5 Files (*.h5 *.hdf5);;All Files (*)")
         if not path:
             return
+
+        # Clear previous state so the new video starts fresh
+        self._reset_state_for_new_video()
 
         # Attempt to inspect the file to find a suitable dataset
         try:
@@ -922,6 +1056,23 @@ class C_Elegans_GUI(QMainWindow):
         self.left_layout = QVBoxLayout()
         self.left_layout.setAlignment(Qt.AlignTop)
         self.left_sidebar.setLayout(self.left_layout)
+
+        # Mask output directory row
+        mask_dir_widget = QWidget()
+        mask_dir_layout = QVBoxLayout()
+        mask_dir_layout.setContentsMargins(0, 0, 0, 0)
+        mask_dir_widget.setLayout(mask_dir_layout)
+        mask_dir_layout.addWidget(QLabel("Mask Output Dir:"))
+        self.mask_dir_label = QLabel(self.save_mask_dir)
+        self.mask_dir_label.setWordWrap(True)
+        self.mask_dir_label.setStyleSheet("font-size: 9px; color: #888;")
+        mask_dir_layout.addWidget(self.mask_dir_label)
+        btn_choose_mask_dir = QPushButton("Browse...")
+        btn_choose_mask_dir.setFixedHeight(28)
+        btn_choose_mask_dir.clicked.connect(self.choose_mask_output_dir)
+        mask_dir_layout.addWidget(btn_choose_mask_dir)
+        self.left_layout.addWidget(mask_dir_widget)
+        self.left_layout.addSpacing(10)
 
         self.left_layout.addWidget(QLabel("Tracking Range:"))
         
@@ -1125,6 +1276,9 @@ class C_Elegans_GUI(QMainWindow):
     def choose_folder(self):
         folder = QFileDialog.getExistingDirectory(self, "Select Video Directory")
         if folder:
+            # Clear previous state so the new folder load starts fresh
+            self._reset_state_for_new_video()
+
             self.video_path = folder
             # Load images
             files = [f for f in os.listdir(folder) if f.lower().endswith(('.jpg', '.png', '.jpeg'))]
@@ -1589,7 +1743,18 @@ class C_Elegans_GUI(QMainWindow):
             print(f"Video name for tracker: {video_name}")
             print(f"trackerworker video folder: {video_folder}")
             print(f"trackerworker frame range: {start_frame} to {end_frame}")
-            self.worker = TrackerWorker(video_folder, self.device, prompts, colors=self.colors, model_size=getattr(self, 'model_size', 'base'), start_frame=start_frame, end_frame=end_frame, video_name=video_name, num_centerline_points=self.centerline_points_spin.value())
+            self.worker = TrackerWorker(
+                video_folder,
+                self.device,
+                prompts,
+                colors=self.colors,
+                model_size=getattr(self, 'model_size', 'base'),
+                start_frame=start_frame,
+                end_frame=end_frame,
+                video_name=video_name,
+                num_centerline_points=self.centerline_points_spin.value(),
+                save_mask_dir=self.save_mask_dir,
+            )
             self.worker.maskSaved.connect(self._on_mask_saved)
             self.worker.centerlineComputed.connect(self._on_centerline_computed)
             self.worker.finished.connect(self.on_tracking_finished)
@@ -1611,6 +1776,19 @@ class C_Elegans_GUI(QMainWindow):
         for i in range(start, end + 1):
             if i not in self.pixmap_cache:
                 self._image_loader.request(i)
+
+    def choose_mask_output_dir(self):
+        folder = QFileDialog.getExistingDirectory(self, "Select Mask Output Directory", self.save_mask_dir)
+        if folder:
+            self.save_mask_dir = folder
+            try:
+                self.mask_dir_label.setText(folder)
+            except Exception:
+                pass
+            try:
+                self.status_label.setText(f"Mask output directory set to: {folder}")
+            except Exception:
+                pass
 
     def _on_frame_loaded(self, idx, img_rgb):
         # Called in GUI thread when image loader has RGB numpy image ready
