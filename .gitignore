@@ -6,3 +6,5 @@ small_thumbnails
 sam2_configs
 checkpoints
 .DS_Store
+merge
+__pycache__
