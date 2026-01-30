@@ -4,7 +4,7 @@ ordered_thumbnails
 ordered_thumbnails_cropped
 small_thumbnails
 sam2_configs
-checkpoints
+checkpoints/*.pt
 .DS_Store
 merge
 __pycache__
