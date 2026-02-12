@@ -21,6 +21,7 @@ from PyQt5.QtCore import Qt, QThread, pyqtSignal, QTimer, QEvent
 from PyQt5.QtGui import QImage, QPixmap, QPainter, QColor, QPen, QFont
 from queue import Queue, Empty
 from collections import OrderedDict
+from config import *
 
 # --- Check for SAM 2 ---
 try:
@@ -29,8 +30,6 @@ try:
 except ImportError:
     SAM2_AVAILABLE = False
     print("Warning: SAM 2 library not found. Tracking will not function.")
-
-# --- Logic from your script (Refactored) ---
 
 def process_image_and_scale_centers(img, downsample_resolution=8, min_area=1000, max_area=50000, min_hole_area=100000, num_skeleton_points=10):
     # [Exactly as provided in your prompt]
@@ -101,10 +100,10 @@ class TrackerWorker(QThread):
     maskSaved = pyqtSignal(int, str) # Emits (frame_idx, mask_file_path) when mask is saved
     centerlineComputed = pyqtSignal(int, dict) # Emits (frame_idx, {obj_id: centerline_points})
 
-    def __init__(self, video_path, device, scaled_blob_centers, colors=None, model_size='base', start_frame=0, end_frame=None, video_name=None, num_centerline_points=100, save_mask_dir="./masks"):
+    def __init__(self, h5_path, device, scaled_blob_centers, colors=None, model_size='base', start_frame=0, end_frame=None, video_name=None, num_centerline_points=100, save_mask_dir="./masks", batch_size=BATCH_SIZE):
         super().__init__()
+        self.h5_path = h5_path
         self.save_mask_dir = save_mask_dir
-        self.video_path = video_path
         self.device = device
         self.scaled_blob_centers = scaled_blob_centers
         self.model_size = model_size
@@ -112,12 +111,71 @@ class TrackerWorker(QThread):
         self.end_frame = int(end_frame) if end_frame is not None else None
         self.video_name = video_name  # Store video_name (h5_file_path or video folder name)
         self.num_centerline_points = int(num_centerline_points) if num_centerline_points is not None else 100
+        self.batch_size = int(batch_size) if batch_size is not None else BATCH_SIZE
         self._stop_requested = False
         # Colors can be passed in; if not, fall back to random colors
         if colors is None:
             self.colors = np.random.randint(0, 255, (100, 3), dtype=np.uint8)
         else:
             self.colors = colors # We need colors here now to bake them into the images
+        print(f"Initialized TrackerWorker with start_frame={self.start_frame}, end_frame={self.end_frame}, batch_size={self.batch_size}")
+
+    def create_temp_video_dir_from_h5(self, start_frame, end_frame, dataset_name=None):
+        print(f"Creating temporary video directory from HDF5 frames {start_frame} to {end_frame}...")
+        with h5py.File(self.h5_path, 'r') as f:
+            ds_name = dataset_name
+            if ds_name is None:
+                for pref in ('images', 'frames', 'data'):
+                    if pref in f:
+                        ds_name = pref
+                        break
+            if ds_name is None:
+                for k in f.keys():
+                    if isinstance(f[k], h5py.Dataset):
+                        ds_name = k
+                        break
+            if ds_name is None:
+                self.error.emit('No dataset found in HDF5')
+                return
+
+            ds = f[ds_name]
+            n_frames = end_frame - start_frame + 1
+            temp_dir = tempfile.mkdtemp(prefix='h5_frames_')
+            for i in tqdm(range(start_frame, end_frame + 1), desc=f"Exporting frames {start_frame}-{end_frame} from HDF5..."):
+                arr = np.asarray(ds[i])
+                if arr.ndim == 2:
+                    out = cv2.cvtColor(arr.astype(np.uint8), cv2.COLOR_GRAY2BGR)
+                elif arr.ndim == 3 and arr.shape[2] == 3:
+                    # normalize to 0-255 if needed
+                    if arr.dtype != np.uint8:
+                        arrf = arr.astype(np.float32)
+                        m = arrf.max()
+                        if m == 0:
+                            out = (arrf * 0).astype(np.uint8)
+                        else:
+                            out = (255.0 * (arrf / m)).astype(np.uint8)
+                    else:
+                        out = arr.astype(np.uint8)
+                    # convert RGB->BGR if needed (assume RGB)
+                    out = cv2.cvtColor(out, cv2.COLOR_RGB2BGR)
+                else:
+                    # unsupported dim
+                    continue
+                
+                # NOTE: this temp folder preserves the same frame indexing as the HDF5
+                # (so not zero-based)
+                save_path = os.path.join(temp_dir, f"{i}.jpg")
+                cv2.imwrite(save_path, out)
+                print(f"Exported frame {i} to {save_path}")
+                frames_processed = i - self.start_frame + 1
+                if frames_processed % max(1, n_frames // 100) == 0:
+                    pct = int(100.0 * frames_processed / n_frames)
+                    self.progress.emit(pct)                 
+
+        print(f"Temporary video directory created at {temp_dir}")
+        print("------- Finished exporting frames from HDF5 -------")
+        return temp_dir
+
 
     def request_stop(self):
         """Request the worker to stop after the current iteration."""
@@ -137,16 +195,190 @@ class TrackerWorker(QThread):
             resampled = [centerline[j] for j in indices]
             return resampled
 
+    def _initialize_model(self):
+        model_size = getattr(self, 'model_size', 'base')
+        sam2_checkpoint, model_cfg = None, None
+        if model_size == 'tiny':
+            sam2_checkpoint = "./checkpoints/sam2.1_hiera_tiny.pt"
+            model_cfg = "configs/sam2.1/sam2.1_hiera_t.yaml"
+        elif model_size == 'base':
+            sam2_checkpoint = "./checkpoints/sam2.1_hiera_base_plus.pt"
+            model_cfg = "configs/sam2.1/sam2.1_hiera_b+.yaml"
+        elif model_size == 'large':
+            sam2_checkpoint = "./checkpoints/sam2.1_hiera_large.pt"
+            model_cfg = "configs/sam2.1/sam2.1_hiera_l.yaml"
+        else:
+            self.error.emit(f"Unknown model size: {model_size}")
+        if not os.path.exists(sam2_checkpoint):
+            self.error.emit(f"Checkpoint not found: {sam2_checkpoint}")
+        return model_cfg, sam2_checkpoint
+    
+
+    def _get_batch_prompt(self, batch_start_frame):
+        pass
+        
+    def _save_prompt_visualization(self, prompts, temp_video_path, batch_start_frame, output_dir):
+        """
+        Save a visualization of the prompts being used for this batch.
+        
+        Args:
+            prompts: list of prompt dicts
+            temp_video_path: path to temporary video directory
+            batch_start_frame: global frame index for this batch
+            output_dir: directory to save visualization
+        """
+        import os
+        os.makedirs(output_dir, exist_ok=True)
+        
+        # Load the first frame from the temp video
+        first_frame_path = os.path.join(temp_video_path, sorted(os.listdir(temp_video_path))[0])
+        img = cv2.imread(first_frame_path)
+        if img is None:
+            print(f"WARNING: Could not load frame for visualization: {first_frame_path}")
+            return
+        
+        # Create visualization overlay
+        vis_img = img.copy()
+        
+        # Define colors for different objects
+        obj_colors = [
+            (0, 255, 0),    # Green
+            (255, 0, 0),    # Blue
+            (0, 0, 255),    # Red
+            (255, 255, 0),  # Cyan
+            (255, 0, 255),  # Magenta
+            (0, 255, 255),  # Yellow
+        ]
+        
+        for prompt in prompts:
+            obj_id = prompt['obj_id']
+            color = obj_colors[(obj_id - 1) % len(obj_colors)]
+            
+            if 'points' in prompt:
+                # Draw point prompts
+                points = prompt['points']
+                labels = prompt['labels']
+                
+                for point, label in zip(points, labels):
+                    x, y = int(point[0]), int(point[1])
+                    if label == 1:  # Positive point
+                        cv2.circle(vis_img, (x, y), 5, color, -1)
+                        cv2.circle(vis_img, (x, y), 7, (255, 255, 255), 2)
+                    else:  # Negative point
+                        cv2.circle(vis_img, (x, y), 5, (0, 0, 0), -1)
+                        cv2.circle(vis_img, (x, y), 7, color, 2)
+                        # Draw X for negative points
+                        cv2.line(vis_img, (x-5, y-5), (x+5, y+5), color, 2)
+                        cv2.line(vis_img, (x-5, y+5), (x+5, y-5), color, 2)
+                
+                # Draw lines connecting the points to show centerline
+                if len(points) > 1:
+                    for i in range(len(points) - 1):
+                        pt1 = (int(points[i][0]), int(points[i][1]))
+                        pt2 = (int(points[i+1][0]), int(points[i+1][1]))
+                        cv2.line(vis_img, pt1, pt2, color, 1)
+                
+                # Add text label
+                if len(points) > 0:
+                    text_pos = (int(points[0][0]) + 10, int(points[0][1]) - 10)
+                    cv2.putText(vis_img, f"Obj {obj_id} ({len(points)} pts)", 
+                               text_pos, cv2.FONT_HERSHEY_SIMPLEX, 0.5, color, 2)
+            
+            elif 'mask' in prompt:
+                # Draw mask prompts as colored overlay
+                mask = prompt['mask']
+                mask_overlay = np.zeros_like(img)
+                mask_overlay[mask] = color
+                
+                # Blend with original image
+                vis_img = cv2.addWeighted(vis_img, 0.7, mask_overlay, 0.3, 0)
+                
+                # Draw mask boundary
+                contours, _ = cv2.findContours(mask.astype(np.uint8), 
+                                               cv2.RETR_EXTERNAL, 
+                                               cv2.CHAIN_APPROX_SIMPLE)
+                cv2.drawContours(vis_img, contours, -1, color, 2)
+                
+                # Add text label
+                if len(contours) > 0:
+                    M = cv2.moments(contours[0])
+                    if M["m00"] != 0:
+                        cx = int(M["m10"] / M["m00"])
+                        cy = int(M["m01"] / M["m00"])
+                        cv2.putText(vis_img, f"Obj {obj_id} (mask)", 
+                                   (cx, cy), cv2.FONT_HERSHEY_SIMPLEX, 0.5, color, 2)
+            
+            if 'negative_points' in prompt:
+                negative_points = prompt['negative_points']
+                red_bgr = (0, 0, 255)  # Red in BGR
+                
+                for point in negative_points:
+                    x, y = int(point[0]), int(point[1])
+                    cv2.circle(vis_img, (x, y), 5, red_bgr, -1)
+                    cv2.circle(vis_img, (x, y), 7, red_bgr, 2)
+                    # Draw X for negative points
+                    cv2.line(vis_img, (x-5, y-5), (x+5, y+5), red_bgr, 2)
+                    cv2.line(vis_img, (x-5, y+5), (x+5, y-5), red_bgr, 2)
+            # NEW: Draw eroded mask if available
+            
+            
+            if 'eroded_mask' in prompt:
+                eroded_mask = prompt['eroded_mask']
+                # Draw eroded mask boundary in a different color (lighter/dashed)
+                contours, _ = cv2.findContours(eroded_mask.astype(np.uint8), 
+                                            cv2.RETR_EXTERNAL, 
+                                            cv2.CHAIN_APPROX_SIMPLE)
+                # Draw with dashed line effect by drawing every other segment
+                for contour in contours:
+                    for i in range(0, len(contour), 2):
+                        if i + 1 < len(contour):
+                            pt1 = tuple(contour[i][0])
+                            pt2 = tuple(contour[i+1][0])
+                            cv2.line(vis_img, pt1, pt2, (200, 200, 200), 1)  # Light gray dashed
+                
+                # Also show as semi-transparent overlay
+                eroded_overlay = np.zeros_like(img)
+                eroded_overlay[eroded_mask] = (128, 128, 128)  # Gray
+                vis_img = cv2.addWeighted(vis_img, 0.85, eroded_overlay, 0.15, 0)
+
+            if 'dilated_mask' in prompt:
+                dilated_mask = prompt['dilated_mask']
+                # Draw dilated mask boundary in a different color (cyan/light blue)
+                contours, _ = cv2.findContours(dilated_mask.astype(np.uint8), 
+                                            cv2.RETR_EXTERNAL, 
+                                            cv2.CHAIN_APPROX_SIMPLE)
+                # Draw with dashed line effect
+                for contour in contours:
+                    for i in range(0, len(contour), 2):
+                        if i + 1 < len(contour):
+                            pt1 = tuple(contour[i][0])
+                            pt2 = tuple(contour[i+1][0])
+                            cv2.line(vis_img, pt1, pt2, (255, 255, 0), 1)  # Cyan dashed
+                
+                # Also show as semi-transparent overlay
+                dilated_overlay = np.zeros_like(img)
+                dilated_overlay[dilated_mask] = (255, 255, 0)  # Cyan
+                vis_img = cv2.addWeighted(vis_img, 0.90, dilated_overlay, 0.10, 0)
+        # Add batch info
+        cv2.putText(vis_img, f"Batch start frame: {batch_start_frame}", 
+                   (10, 30), cv2.FONT_HERSHEY_SIMPLEX, 1, (255, 255, 255), 2)
+        
+        # Save visualization
+        output_path = os.path.join(output_dir, f"prompts_batch_{batch_start_frame}.jpg")
+        cv2.imwrite(output_path, vis_img)
+        print(f"Saved prompt visualization to {output_path}")
+    
     def run(self):
         """
         Given a temporary video folder path, runs SAM 2 tracking with the provided prompts.
         (this temporary video folder is just the selected frames exported from the HDF5 file)
         """
         try:
+            print("Starting run method of TrackerWorker...")
             # 1. Setup Folders
-            parent_dir = os.path.dirname(os.path.normpath(self.video_path))
+            # (self.save_mask_dir is either chosen, or the parent dir of the video)
             ts = datetime.now().strftime("%Y%m%d_%H%M%S")
-            video_name = os.path.basename(os.path.normpath(self.video_path))
+            video_name = os.path.basename(os.path.normpath(self.h5_path))
             print(f"Chosen save_mask_dir: {self.save_mask_dir}")
             print(f"Video name: {video_name}")
 
@@ -155,118 +387,242 @@ class TrackerWorker(QThread):
             print(f"Initialized mask output directory at: {mask_output_dir}")
 
             # 2. Initialize Model based on selected model_size
-            model_size = getattr(self, 'model_size', 'base')
-            if model_size == 'tiny':
-                sam2_checkpoint = "./checkpoints/sam2.1_hiera_tiny.pt"
-                model_cfg = "configs/sam2.1/sam2.1_hiera_t.yaml"
-            elif model_size == 'base':
-                sam2_checkpoint = "./checkpoints/sam2.1_hiera_base_plus.pt"
-                model_cfg = "configs/sam2.1/sam2.1_hiera_b+.yaml"
-            elif model_size == 'large':
-                sam2_checkpoint = "./checkpoints/sam2.1_hiera_large.pt"
-                model_cfg = "configs/sam2.1/sam2.1_hiera_l.yaml"
-            else:
-                self.error.emit(f"Unknown model size: {model_size}")
-                return
-            if not os.path.exists(sam2_checkpoint):
-                self.error.emit(f"Checkpoint not found: {sam2_checkpoint}")
-                return
-
-            
+            model_cfg, sam2_checkpoint = self._initialize_model()
             predictor = build_sam2_video_predictor(model_cfg, sam2_checkpoint, device=self.device)
-            inference_state = predictor.init_state(video_path=self.video_path)
-            print(f"Initialized inference state w video path: {self.video_path}")
-            
-            # 3. Add Prompts
-            for i, prompts in enumerate(self.scaled_blob_centers):
-                if not prompts:
-                    continue
-                ann_obj_id = i + 1
-                # prompts is a list of ((x, y), label) tuples
-                points = np.array([pt for pt, _ in prompts], dtype=np.float32)
-                labels = np.array([lbl for _, lbl in prompts], dtype=np.int32)
-                predictor.add_new_points_or_box(
-                    inference_state=inference_state,
-                    frame_idx=0, # 0 in the temporary folder
-                    obj_id=ann_obj_id,
-                    points=points,
-                    labels=labels,
-                )
+
+            # Store centerlines: {frame_idx: {obj_id: [(x, y), ...]}}
+            all_centerlines = {}
 
             # 4. Propagate and Save to Disk Immediately
             print(f"Propagating and saving masks to {mask_output_dir}...")
-            
-            # Get image dimensions from the first frame to ensure mask matches
-            first_frame_path = os.path.join(self.video_path, sorted(os.listdir(self.video_path))[0])
-            ref_img = cv2.imread(first_frame_path)
-            h, w = ref_img.shape[:2]
-            
-            # Store centerlines: {frame_idx: {obj_id: [(x, y), ...]}}
-            all_centerlines = {}
-            
-            for out_frame_idx, out_obj_ids, out_mask_logits in predictor.propagate_in_video(inference_state):
-                if self._stop_requested:
-                    break
-                save_frame_index = self.start_frame + out_frame_idx
-                # Create a black canvas for the color mask
-                color_mask = np.zeros((h, w, 3), dtype=np.uint8)
-                frame_centerlines = {}
-                
-                for i, out_obj_id in enumerate(out_obj_ids):
-                    # Get binary mask for this object
-                    mask = (out_mask_logits[i] > 0.0).cpu().numpy().squeeze()
-                    
-                    if mask.sum() > 0:
-                        # Resize if necessary (SAM output safety)
-                        if mask.shape != (h, w):
-                            mask = cv2.resize(mask.astype(np.uint8), (w, h), interpolation=cv2.INTER_NEAREST)
-                        
-                        # Get color for this object ID
-                        color = self.colors[out_obj_id % len(self.colors)]
-                        
-                        # Paint the color on the mask
-                        color_mask[mask > 0] = color
-                        
-                        # Extract centerline (skeleton) from mask
-                        try:
-                            # Skeletonize the binary mask
-                            skeleton = skeletonize(mask.astype(bool))
-                            # Get skeleton points
-                            skeleton_coords = np.column_stack(np.where(skeleton))
-                            if len(skeleton_coords) > 0:
-                                # Convert from (y, x) to (x, y)
-                                full_centerline = [(int(pt[1]), int(pt[0])) for pt in skeleton_coords]
-                                # Resample to desired number of points
-                                resampled_centerline = full_centerline
-                                if len(full_centerline) > 1:
-                                    resampled_centerline = self._interpolate_centerline(full_centerline, self.num_centerline_points)
-                                # Store as tuple: (full_skeleton, resampled_points)
-                                frame_centerlines[out_obj_id] = (full_centerline, resampled_centerline)
-                        except Exception as e:
-                            print(f"Failed to compute centerline for object {out_obj_id} in frame {save_frame_index}: {e}")
-                            frame_centerlines[out_obj_id] = ([], [])
+            batch_start_frame = self.start_frame # start from chosen start frame
+            while batch_start_frame < self.end_frame:
+                batch_end_frame = min(batch_start_frame + self.batch_size, self.end_frame)
+                batch_num = (batch_start_frame - self.start_frame) // self.batch_size
+                print(f"Processing batch {batch_num + 1}: frames {batch_start_frame} to {batch_end_frame}")
 
-                # Save the pre-colored mask to the new folder as a compressed JPG
-                # Only save if within requested start/end frame range
-                save_path = os.path.join(mask_output_dir, f"{save_frame_index}.jpg")
-                # Use reasonable JPEG quality to keep files small but good-looking
-                cv2.imwrite(save_path, color_mask, [int(cv2.IMWRITE_JPEG_QUALITY), 90])
+                # Export temporary video segment for the current batch
+                temp_video_path = self.create_temp_video_dir_from_h5(batch_start_frame, batch_end_frame)
+
+                # Reinitialize inference state for each batch (to avoid memory issues)
+                inference_state = predictor.init_state(video_path=temp_video_path)
+                # add prompts for 1st batch
+                if batch_start_frame == self.start_frame:
+                    # Get image dimensions from the first frame to ensure mask matches
+                    first_frame_path = os.path.join(temp_video_path, sorted(os.listdir(temp_video_path))[0])
+                    ref_img = cv2.imread(first_frame_path)
+                    h, w = ref_img.shape[:2]
+                    
+                    for i, prompts in enumerate(self.scaled_blob_centers):
+                        if not prompts:
+                            continue
+                        ann_obj_id = i + 1
+                            # prompts is a list of ((x, y), label) tuples
+                        points = np.array([pt for pt, _ in prompts], dtype=np.float32)
+                        labels = np.array([lbl for _, lbl in prompts], dtype=np.int32)
+                        predictor.add_new_points_or_box(
+                            inference_state=inference_state,
+                            frame_idx=batch_start_frame,
+                            obj_id=ann_obj_id,
+                            points=points,
+                            labels=labels,
+                        )
+                # load mask from previous batch end as prompt
+                else:
+                    prompts_to_visualize = [] # for debugging/visualization
+                    for obj_id in range(len(self.scaled_blob_centers)):
+                        ann_obj_id = obj_id + 1
+                        last_mask_path = os.path.join(mask_output_dir, f"{batch_start_frame}.jpg")
+
+                        if not os.path.exists(last_mask_path):
+                            raise FileNotFoundError(f"Required mask for frame {batch_start_frame} not found")
+                        
+                        mask_colour = cv2.imread(last_mask_path)
+                        mask_gray = cv2.cvtColor(mask_colour, cv2.COLOR_BGR2GRAY)
+                        mask_binary = np.where(mask_gray > 0, 255, 0).astype(np.uint8)
+                        
+                        # TODO: this currently only works if you're tracking only one object
+                        # need to modify to extract the object mask for each obj_id if want to support
+                        # multi-object tracking like so
+                        # predictor.add_new_mask(
+                        #     inference_state=inference_state,
+                        #     frame_idx=0,
+                        #     obj_id=ann_obj_id,
+                        #     mask=mask_binary.astype(bool) # Convert back to boolean mask
+                        # )
+                        kernel_size = 7
+                        kernel_iterations = 5
+                        kernel = np.ones((kernel_size, kernel_size), np.uint8)
+                        eroded_mask = cv2.erode(mask_binary, kernel, iterations=kernel_iterations)
+
+                        # Extract centerline
+                        skeleton = skeletonize(eroded_mask > 0)
+                        centerline_points = np.column_stack(np.where(skeleton > 0))[:, ::-1]
+                        
+                        # Sample centerline points
+                        if len(centerline_points) > 15:
+                            indices = np.linspace(0, len(centerline_points) - 1, 15, dtype=int)
+                            sampled_points = centerline_points[indices]
+                            
+                            # Add centerline as positive points
+                            labels = np.ones(len(sampled_points), dtype=np.int32)
+
+                        else:
+                            sampled_points = centerline_points
+                            labels = np.ones(len(sampled_points), dtype=np.int32)
+                        print(f"Added {len(sampled_points)} centerline points for object {ann_obj_id}")
+
+                        add_negative_points = True
+                        if add_negative_points:
+                                                    # NEW: Extract negative prompts from the boundary region
+                            # Dilate the original (non-eroded) mask to find the outer boundary
+                            negative_kernel_dilate_size = 7
+                            negative_kernel_iterations = 5
+                            kernel_dilate = np.ones((negative_kernel_dilate_size, negative_kernel_dilate_size), np.uint8)
+                            dilated_mask = cv2.dilate(mask_binary, kernel_dilate, iterations=negative_kernel_iterations)
+                            # Boundary region = dilated - original
+                            boundary_region = dilated_mask - mask_binary
+                            
+                            # Sample points from the boundary (negative prompts)
+                            boundary_pixels = np.column_stack(np.where(boundary_region > 0))[:, ::-1]
+                            negative_points = []
+                            negative_labels = []
+                            
+                            if len(boundary_pixels) > 0:
+                                # Sample ~10 negative points evenly around the boundary
+                                num_neg_points = min(10, len(boundary_pixels))
+                                if len(boundary_pixels) > num_neg_points:
+                                    neg_indices = np.linspace(0, len(boundary_pixels) - 1, num_neg_points, dtype=int)
+                                    negative_points = boundary_pixels[neg_indices]
+                                else:
+                                    negative_points = boundary_pixels
+                                negative_labels = np.zeros(len(negative_points), dtype=np.int32)
+                            
+                            # Combine positive and negative points
+                            all_points = np.vstack([sampled_points, negative_points]) if len(negative_points) > 0 else sampled_points
+                            all_labels = np.concatenate([labels, negative_labels]) if len(negative_labels) > 0 else labels
+                            print(f"Added {len(negative_points)} negative points for object {ann_obj_id}")
+                        else:
+                            all_points = sampled_points
+                            all_labels = labels
+
+                        predictor.add_new_points_or_box(
+                            inference_state=inference_state,
+                            frame_idx=0,
+                            obj_id=ann_obj_id,
+                            points=all_points,
+                            labels=all_labels,
+                        )
+                                                # Store for visualization
+                        # Store for visualization
+                        prompt_dict = {
+                            'obj_id': ann_obj_id,
+                            'points': sampled_points,
+                            'labels': labels,
+                            'frame_idx': 0,
+                            'eroded_mask': eroded_mask.astype(bool),
+                        }
+                        
+                        # Only add dilated_mask if negative points are being used
+                        if add_negative_points:
+                            prompt_dict['dilated_mask'] = dilated_mask.astype(bool)
+                            prompt_dict['negative_points'] = negative_points
+                        
+                        prompts_to_visualize.append(prompt_dict)
+                    # Save visualization of prompts for this batch
+                    prompt_vis_dir = os.path.join(mask_output_dir, f"batch_prompts")
+                    self._save_prompt_visualization(prompts_to_visualize, temp_video_path, batch_start_frame, prompt_vis_dir)
                 
-                # Store centerlines for this frame
-                all_centerlines[save_frame_index] = frame_centerlines
+                # DEBUG: Check what's in the inference_state after adding prompts/masks
+                # DEBUG: Check what's in the inference_state after adding prompts/masks
+                print("\n=== DEBUGGING INFERENCE STATE ===")
+                print(f"Batch start frame: {batch_start_frame}")
+                print(f"Is first batch: {batch_start_frame == self.start_frame}")
+                print(f"Inference state type: {type(inference_state)}")
+                print(f"Inference state keys: {list(inference_state.keys())}")
                 
-                # Emit that mask was saved (so GUI can update its index and display)
-                try:
+                # Check for common keys in SAM2 inference state
+                if 'obj_ids' in inference_state:
+                    print(f"Object IDs in state: {inference_state['obj_ids']}")
+                if 'obj_id_to_idx' in inference_state:
+                    print(f"Object ID to index mapping: {inference_state['obj_id_to_idx']}")
+                if 'point_inputs_per_obj' in inference_state:
+                    print(f"Point inputs per object: {list(inference_state['point_inputs_per_obj'].keys())}")
+                    for obj_id, frame_dict in inference_state['point_inputs_per_obj'].items():
+                        print(f"  Object {obj_id}: frames {list(frame_dict.keys())}")
+                if 'mask_inputs_per_obj' in inference_state:
+                    print(f"Mask inputs per object: {list(inference_state['mask_inputs_per_obj'].keys())}")
+                    for obj_id, frame_dict in inference_state['mask_inputs_per_obj'].items():
+                        print(f"  Object {obj_id}: frames {list(frame_dict.keys())}")
+                if 'output_dict' in inference_state:
+                    print(f"Output dict keys: {list(inference_state['output_dict'].keys())}")
+                
+                # Print all keys to see what's actually stored
+                print("\nAll inference_state contents:")
+                for key in inference_state.keys():
+                    val = inference_state[key]
+                    if isinstance(val, dict):
+                        print(f"  {key}: dict with keys {list(val.keys())[:5]}{'...' if len(val) > 5 else ''}")
+                    elif isinstance(val, list):
+                        print(f"  {key}: list of length {len(val)}")
+                    else:
+                        print(f"  {key}: {type(val).__name__}")
+                
+                print("=== END DEBUG ===\n")
+                # breakpoint()
+                for out_frame_idx, out_obj_ids, out_mask_logits in predictor.propagate_in_video(inference_state):
+                    if self._stop_requested:
+                        break
+                    save_frame_index = batch_start_frame + out_frame_idx
+                    print(f"saving local {out_frame_idx} as {save_frame_index}...")
+                    color_mask = np.zeros((h, w, 3), dtype=np.uint8)
+                    frame_centerlines = {}
+                    for i, out_obj_id in enumerate(out_obj_ids):
+                        # Get binary mask for this object
+                        mask = (out_mask_logits[i] > 0.0).cpu().numpy().squeeze()
+                        if mask.sum() > 0:
+                            # Resize if necessary (SAM output safety)
+                            if mask.shape != (h, w):
+                                mask = cv2.resize(mask.astype(np.uint8), (w, h), interpolation=cv2.INTER_NEAREST)
+
+                            # Get color for this object ID
+                            color = self.colors[out_obj_id % len(self.colors)]
+                            
+                            # Paint the color on the mask
+                            color_mask[mask > 0] = color
+                            
+                            # Extract centerline (skeleton) from mask
+                            try:
+                                # Skeletonize the binary mask
+                                skeleton = skeletonize(mask.astype(bool))
+                                # Get skeleton points
+                                skeleton_coords = np.column_stack(np.where(skeleton))
+                                if len(skeleton_coords) > 0:
+                                    # Convert from (y, x) to (x, y)
+                                    full_centerline = [(int(pt[1]), int(pt[0])) for pt in skeleton_coords]
+                                    # Resample to desired number of points
+                                    resampled_centerline = full_centerline
+                                    if len(full_centerline) > 1:
+                                        resampled_centerline = self._interpolate_centerline(full_centerline, self.num_centerline_points)
+                                    # Store as tuple: (full_skeleton, resampled_points)
+                                    frame_centerlines[out_obj_id] = (full_centerline, resampled_centerline)
+                            except Exception as e:
+                                print(f"Failed to compute centerline for object {out_obj_id} in frame {save_frame_index}: {e}")
+                                frame_centerlines[out_obj_id] = ([], [])
+
+                    # Save the pre-colored mask to the new folder as a compressed JPG
+                    save_path = os.path.join(mask_output_dir, f"{save_frame_index}.jpg")
+                    cv2.imwrite(save_path, color_mask)
+                    
+                    # Store centerlines for this frame
+                    all_centerlines[save_frame_index] = frame_centerlines
+                    
+                    # Emit mask was saved (so GUI can update its index and display)
                     self.maskSaved.emit(save_frame_index, save_path)
-                except Exception:
-                    pass
-                
-                # Emit centerlines for this frame
-                try:
                     self.centerlineComputed.emit(save_frame_index, frame_centerlines)
-                except Exception:
-                    pass
-            
+
+                print(f"Finished processing batch {batch_num + 1}")
+                batch_start_frame += self.batch_size
             # Save all centerlines to numpy file
             centerlines_path = os.path.join(mask_output_dir, "centerlines.npy")
             try:
@@ -429,105 +785,6 @@ class ImageLoader(QThread):
         except Exception:
             pass
 
-class ExportH5Worker(QThread):
-    """Export frames from an HDF5 dataset to a temporary folder as JPEGs.
-    Emits `finished(temp_folder)` when done, `progress(int)` updates, and `error(str)` on failure.
-    """
-    finished = pyqtSignal(str)
-    progress = pyqtSignal(int)
-    ready = pyqtSignal(str)
-    error = pyqtSignal(str)
-
-    def __init__(self, h5_path, start_frame, end_frame, dataset_name=None):
-        super().__init__()
-        self.h5_path = h5_path
-        self.start_frame = start_frame
-        self.end_frame = end_frame
-        self.dataset_name = dataset_name
-        # stream_mode: if True, emit `ready` after writing initial frames so consumer can start
-        self.stream_mode = False
-        self.stream_threshold = 10
-        print(f"Initialized ExportH5Worker with start_frame={start_frame}, end_frame={end_frame}, dataset_name={dataset_name}")
-
-    def run(self):
-        if not H5PY_AVAILABLE:
-            self.error.emit("h5py not available")
-            return
-        try:
-            with h5py.File(self.h5_path, 'r') as f:
-                ds_name = self.dataset_name
-                if ds_name is None:
-                    # pick preferred dataset names or first dataset
-                    for pref in ('images', 'frames', 'data'):
-                        if pref in f:
-                            ds_name = pref
-                            break
-                if ds_name is None:
-                    for k in f.keys():
-                        if isinstance(f[k], h5py.Dataset):
-                            ds_name = k
-                            break
-                if ds_name is None:
-                    self.error.emit('No dataset found in HDF5')
-                    return
-
-                ds = f[ds_name]
-                # n_frames = ds.shape[0]
-                n_frames = self.end_frame - self.start_frame + 1
-                temp_dir = tempfile.mkdtemp(prefix='h5_frames_')
-                print(f"{self.start_frame}, {self.end_frame}")
-                for i in tqdm(range(self.start_frame, self.end_frame + 1), desc=f"Exporting frames from HDF5..."):
-                    try:
-                        arr = np.asarray(ds[i])
-                        if arr.ndim == 2:
-                            out = cv2.cvtColor(arr.astype(np.uint8), cv2.COLOR_GRAY2BGR)
-                        elif arr.ndim == 3 and arr.shape[2] == 3:
-                            if arr.dtype != np.uint8:
-                                # normalize to 0-255
-                                arrf = arr.astype(np.float32)
-                                m = arrf.max()
-                                if m == 0:
-                                    out = (arrf * 0).astype(np.uint8)
-                                else:
-                                    out = (255.0 * (arrf / m)).astype(np.uint8)
-                            else:
-                                out = arr.astype(np.uint8)
-                            # convert RGB->BGR if needed (assume RGB)
-                            out = cv2.cvtColor(out, cv2.COLOR_RGB2BGR)
-                        else:
-                            # unsupported dim
-                            continue
-
-                        save_path = os.path.join(temp_dir, f"{i}.jpg")
-                        cv2.imwrite(save_path, out, [int(cv2.IMWRITE_JPEG_QUALITY), 90])
-                        frames_processed = i - self.start_frame + 1
-                        if frames_processed % max(1, n_frames // 100) == 0:
-                            pct = int(100.0 * frames_processed / n_frames)
-                            self.progress.emit(pct)
-
-                        # if streaming, emit ready once we've written enough frames to start
-                        if self.stream_mode and frames_processed == min(self.stream_threshold, n_frames):
-                            try:
-                                print("Emitting ready signal from ExportH5Worker")
-                                self.ready.emit(temp_dir)
-                            except Exception:
-                                pass
-                        elif frames_processed == n_frames:
-                            try:
-                                print("Emitting ready signal from ExportH5Worker")
-                                self.ready.emit(temp_dir)
-                            except Exception:
-                                pass                          
-                    except Exception as e:
-                        print(f"Skipping processing frame {i}: {e}")
-                        # skip problematic frames
-                        continue
-            self.finished.emit(temp_dir)
-        except Exception as e:
-            import traceback
-            traceback.print_exc()
-            self.error.emit(str(e))
-
 class C_Elegans_GUI(QMainWindow):
     def __init__(self):
         super().__init__()
@@ -580,7 +837,7 @@ class C_Elegans_GUI(QMainWindow):
         # Parent directory of current video (for optional use as mask output)
         self.video_parent_dir = None
         # Whether to use parent dir for masks instead of save_mask_dir
-        self.use_parent_dir_for_masks = False
+        self.use_parent_dir_for_masks = USE_PARENT_DIR_FOR_MASKS
 
 
         # Setup Device
@@ -934,7 +1191,7 @@ class C_Elegans_GUI(QMainWindow):
         parent_dir_checkbox_layout = QHBoxLayout()
         parent_dir_checkbox_layout.setContentsMargins(0, 0, 0, 0)
         self.use_parent_dir_checkbox = QCheckBox()
-        self.use_parent_dir_checkbox.setChecked(False)
+        self.use_parent_dir_checkbox.setChecked(USE_PARENT_DIR_FOR_MASKS)
         self.use_parent_dir_checkbox.stateChanged.connect(self._on_use_parent_dir_changed)
         parent_dir_checkbox_layout.addWidget(self.use_parent_dir_checkbox)
         self.parent_dir_label_text = QLabel("use parent dir: (no video loaded)")
@@ -1029,6 +1286,21 @@ class C_Elegans_GUI(QMainWindow):
         centerline_row_layout.addWidget(self.centerline_points_spin)
         centerline_row_layout.addStretch()
         self.left_layout.addWidget(centerline_row_widget)
+
+        # Batch size row
+        batch_size_row_widget = QWidget()
+        batch_size_row_layout = QHBoxLayout()
+        batch_size_row_layout.setContentsMargins(0, 0, 0, 0)
+        batch_size_row_widget.setLayout(batch_size_row_layout)
+        batch_size_row_layout.addWidget(QLabel("Batch Size:"))
+        self.batch_size_spin = QSpinBox()
+        self.batch_size_spin.setMinimum(1)
+        self.batch_size_spin.setMaximum(10000)
+        self.batch_size_spin.setValue(BATCH_SIZE)
+        self.batch_size_spin.setFixedWidth(60)
+        batch_size_row_layout.addWidget(self.batch_size_spin)
+        batch_size_row_layout.addStretch()
+        self.left_layout.addWidget(batch_size_row_widget)
 
 
         # Buttons
@@ -1441,27 +1713,9 @@ class C_Elegans_GUI(QMainWindow):
             except Exception:
                 end_frame = None
             
-
-            # start export worker
-            try:
-                self.btn_track.setEnabled(False)
-                self.btn_autosegment.setEnabled(False)
-                self.status_label.setText("Exporting HDF5 frames to temporary folder...")
-                self._export_worker = ExportH5Worker(self.h5_file_path, start_frame, end_frame, getattr(self, 'h5_dataset_name', None))
-                self._export_worker.stream_mode = self.stream_mode_checkbox.isChecked()
-                self._export_worker.stream_threshold = self.stream_threshold_spin.value()
-                # show progress
-                self._export_worker.progress.connect(lambda p: self.status_label.setText(f"Exporting frames... {p}%"))
-                # when stream ready, start tracker (but keep exporting remaining frames)
-                self._export_worker.ready.connect(self._on_h5_export_ready)
-                # when finished, still call on_tracking_finished so masks can be indexed
-                # self._export_worker.finished.connect(self.on_tracking_finished)
-                self._export_worker.error.connect(self.on_tracking_error)
-                self._export_worker.start()
-                return
-            except Exception as e:
-                QMessageBox.critical(self, "Error", f"Failed to start HDF5 export: {e}")
-                return
+            # Start TrackerWorker with HDF5 export integrated
+            print("------- Exporting frames from HDF5 for tracking...")
+            self._start_tracker_worker(start_frame=start_frame, end_frame=end_frame)
 
         # determine requested frame range from spinboxes (if present)
         try:
@@ -1471,8 +1725,9 @@ class C_Elegans_GUI(QMainWindow):
             start_frame = 0
             end_frame = None
 
-        # normal folder-based tracking
-        self._start_tracker_worker(self.video_path, start_frame=start_frame, end_frame=end_frame)
+        # # normal folder-based tracking
+        # print(f"Normal folder-based tracking from frame {start_frame} to {end_frame}")
+        # self._start_tracker_worker(start_frame=start_frame, end_frame=end_frame)
 
     def stop_tracking(self):
         """Request an early stop for ongoing tracking."""
@@ -1487,12 +1742,13 @@ class C_Elegans_GUI(QMainWindow):
         except Exception:
             pass
 
-    def _start_tracker_worker(self, video_folder, start_frame=0, end_frame=None):
+    def _start_tracker_worker(self, start_frame, end_frame):
         """Start the TrackerWorker using the given video_folder path."""
         try:
             self.btn_track.setEnabled(False)
             self.btn_autosegment.setEnabled(False)
             self.status_label.setText("Tracking in progress... This may take a moment.")
+            print("------------------------------")
             print(f"Starting tracker for frames {start_frame} to {end_frame}")
             # fetch prompts for all objects in the requested start frame
             prompts = self.get_prompts_for_frame(start_frame)
@@ -1503,9 +1759,6 @@ class C_Elegans_GUI(QMainWindow):
                 return
 
             video_name = getattr(self, 'h5_file_path', None) or self.video_path
-            print(f"Video name for tracker: {video_name}")
-            print(f"trackerworker video folder: {video_folder}")
-            print(f"trackerworker frame range: {start_frame} to {end_frame}")
             
             # Determine which mask output directory to use
             mask_output_dir = self.save_mask_dir
@@ -1513,8 +1766,10 @@ class C_Elegans_GUI(QMainWindow):
                 mask_output_dir = self.video_parent_dir
                 print(f"Using parent directory for masks: {mask_output_dir}")
             
+            print(f"h5 file path: {getattr(self, 'h5_file_path', None)}")
+            # Start tracker worker
             self.worker = TrackerWorker(
-                video_folder,
+                self.h5_file_path if getattr(self, 'h5_file_path', None) is not None else self.video_path,
                 self.device,
                 prompts,
                 colors=self.colors,
@@ -1524,11 +1779,17 @@ class C_Elegans_GUI(QMainWindow):
                 video_name=video_name,
                 num_centerline_points=self.centerline_points_spin.value(),
                 save_mask_dir=mask_output_dir,
+                batch_size=self.batch_size_spin.value(),
             )
+            print("connecting maskSaved signal")
             self.worker.maskSaved.connect(self._on_mask_saved)
+            print("connecting centerlineComputed signal")
             self.worker.centerlineComputed.connect(self._on_centerline_computed)
+            print("connecting finished signal")
             self.worker.finished.connect(self.on_tracking_finished)
+            print("connecting error signal")
             self.worker.error.connect(self.on_tracking_error)
+            print("starting worker thread")
             self.worker.start()
             try:
                 self.btn_stop.setEnabled(True)
@@ -2138,26 +2399,6 @@ class C_Elegans_GUI(QMainWindow):
             self.btn_stop.setEnabled(False)
         except Exception:
             pass
-
-    def _on_h5_export_finished(self, temp_folder):
-        """Called when ExportH5Worker finishes exporting frames to `temp_folder`."""
-        try:
-            self._h5_export_tempdir = temp_folder
-            # determine requested start/end from spinboxes (if present)
-            try:
-                start_frame = int(self.start_spin.value()) if hasattr(self, 'start_spin') else 0
-                end_frame = int(self.end_spin.value()) if hasattr(self, 'end_spin') else None
-            except Exception:
-                start_frame = 0
-                end_frame = None
-            # start tracker with the exported folder and requested range
-            print(f"starting tracker for frames {start_frame} to {end_frame} after export")
-            print(f"temp folder: {temp_folder}")
-            self._start_tracker_worker(temp_folder, start_frame=start_frame, end_frame=end_frame)
-        except Exception as e:
-            QMessageBox.critical(self, "Error", f"Failed to start tracker after export: {e}")
-            self.btn_track.setEnabled(True)
-            self.btn_autosegment.setEnabled(True)
 
     def _on_h5_export_ready(self, temp_folder):
         """Called when exporter has written an initial batch of frames and the tracker can start."""
