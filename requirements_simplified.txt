@@ -25,3 +25,6 @@ omegaconf
 tqdm
 wandb
 pydantic
+
+PyQt5
+h5py
