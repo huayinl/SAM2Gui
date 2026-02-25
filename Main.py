@@ -397,6 +397,8 @@ class TrackerWorker(QThread):
             print(f"Propagating and saving masks to {mask_output_dir}...")
             batch_start_frame = self.start_frame # start from chosen start frame
             while batch_start_frame < self.end_frame:
+                if self._stop_requested:
+                    break
                 batch_end_frame = min(batch_start_frame + self.batch_size, self.end_frame)
                 batch_num = (batch_start_frame - self.start_frame) // self.batch_size
                 print(f"Processing batch {batch_num + 1}: frames {batch_start_frame} to {batch_end_frame}")
@@ -432,7 +434,7 @@ class TrackerWorker(QThread):
                     prompts_to_visualize = [] # for debugging/visualization
                     for obj_id in range(len(self.scaled_blob_centers)):
                         ann_obj_id = obj_id + 1
-                        last_mask_path = os.path.join(mask_output_dir, f"{batch_start_frame}.jpg")
+                        last_mask_path = os.path.join(mask_output_dir, f"{batch_start_frame}_mask.jpg")
 
                         if not os.path.exists(last_mask_path):
                             raise FileNotFoundError(f"Required mask for frame {batch_start_frame} not found")
@@ -611,7 +613,7 @@ class TrackerWorker(QThread):
                                 frame_centerlines[out_obj_id] = ([], [])
 
                     # Save the pre-colored mask to the new folder as a compressed JPG
-                    save_path = os.path.join(mask_output_dir, f"{save_frame_index}.jpg")
+                    save_path = os.path.join(mask_output_dir, f"{save_frame_index}_mask.jpg")
                     cv2.imwrite(save_path, color_mask)
                     
                     # Store centerlines for this frame
@@ -814,6 +816,8 @@ class C_Elegans_GUI(QMainWindow):
         self.centerlines = {}
         # Mask opacity (0.0 to 1.0, where 1.0 = fully opaque)
         self.mask_opacity = 0.5
+        # Prompt point size for visualization
+        self.prompt_point_size = 5
         # Simple in-memory cache for recently-used color masks to speed up display
         self._mask_cache = {}
         self._mask_cache_max = 64
@@ -1302,6 +1306,22 @@ class C_Elegans_GUI(QMainWindow):
         batch_size_row_layout.addStretch()
         self.left_layout.addWidget(batch_size_row_widget)
 
+        # Prompt point size row
+        prompt_size_row_widget = QWidget()
+        prompt_size_row_layout = QHBoxLayout()
+        prompt_size_row_layout.setContentsMargins(0, 0, 0, 0)
+        prompt_size_row_widget.setLayout(prompt_size_row_layout)
+        prompt_size_row_layout.addWidget(QLabel("Prompt Size:"))
+        self.prompt_size_spin = QSpinBox()
+        self.prompt_size_spin.setMinimum(1)
+        self.prompt_size_spin.setMaximum(50)
+        self.prompt_size_spin.setValue(5)
+        self.prompt_size_spin.setFixedWidth(60)
+        self.prompt_size_spin.valueChanged.connect(self._on_prompt_size_changed)
+        prompt_size_row_layout.addWidget(self.prompt_size_spin)
+        prompt_size_row_layout.addStretch()
+        self.left_layout.addWidget(prompt_size_row_widget)
+
 
         # Buttons
         btn_layout = QHBoxLayout()
@@ -1521,6 +1541,17 @@ class C_Elegans_GUI(QMainWindow):
             
             # Clear cache and reload current frame
             self.clear_pixmap_cache()
+            self._image_loader.request(self.current_frame_idx)
+        except Exception:
+            pass
+
+    def _on_prompt_size_changed(self, value):
+        """Handle prompt point size spinbox changes - redraw prompts."""
+        self.prompt_point_size = value
+        # Clear pixmap cache so prompts get redrawn with new size
+        self.clear_pixmap_cache()
+        # Request reload of current frame to show new size immediately
+        try:
             self._image_loader.request(self.current_frame_idx)
         except Exception:
             pass
