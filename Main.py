@@ -25,7 +25,7 @@ from config import *
 
 # --- Check for SAM 2 ---
 try:
-    from sam2.build_sam import build_sam2_video_predictor
+    from segment_anything_2.sam2.build_sam import build_sam2_video_predictor
     SAM2_AVAILABLE = True
 except ImportError:
     SAM2_AVAILABLE = False
@@ -100,7 +100,8 @@ class TrackerWorker(QThread):
     maskSaved = pyqtSignal(int, str) # Emits (frame_idx, mask_file_path) when mask is saved
     centerlineComputed = pyqtSignal(int, dict) # Emits (frame_idx, {obj_id: centerline_points})
 
-    def __init__(self, h5_path, device, scaled_blob_centers, colors=None, model_size='base', start_frame=0, end_frame=None, video_name=None, num_centerline_points=100, save_mask_dir="./masks", batch_size=BATCH_SIZE):
+    def __init__(self, h5_path, device, scaled_blob_centers, colors=None, model_size='base', start_frame=0, end_frame=None, video_name=None, num_centerline_points=100, save_mask_dir="./masks", batch_size=BATCH_SIZE,
+                 kernel_size=None, kernel_iterations=None, num_positive_prompts=None, negative_kernel_size=None, negative_kernel_iterations=None, num_negative_prompts=None):
         super().__init__()
         self.h5_path = h5_path
         self.save_mask_dir = save_mask_dir
@@ -118,6 +119,14 @@ class TrackerWorker(QThread):
             self.colors = np.random.randint(0, 255, (100, 3), dtype=np.uint8)
         else:
             self.colors = colors # We need colors here now to bake them into the images
+
+        # Tracking parameter overrides (fall back to config if None)
+        self.kernel_size = kernel_size if kernel_size is not None else KERNEL_SIZE
+        self.kernel_iterations = kernel_iterations if kernel_iterations is not None else KERNEL_ITERATIONS
+        self.num_positive_prompts = num_positive_prompts if num_positive_prompts is not None else NUM_POSITIVE_PROMPTS
+        self.negative_kernel_size = negative_kernel_size if negative_kernel_size is not None else NEGATIVE_KERNEL_SIZE
+        self.negative_kernel_iterations = negative_kernel_iterations if negative_kernel_iterations is not None else NEGATIVE_KERNEL_ITERATIONS
+        self.num_negative_prompts = num_negative_prompts if num_negative_prompts is not None else NUM_NEGATIVE_PROMPTS
         print(f"Initialized TrackerWorker with start_frame={self.start_frame}, end_frame={self.end_frame}, batch_size={self.batch_size}")
 
     def create_temp_video_dir_from_h5(self, start_frame, end_frame, dataset_name=None):
@@ -175,8 +184,6 @@ class TrackerWorker(QThread):
         print(f"Temporary video directory created at {temp_dir}")
         print("------- Finished exporting frames from HDF5 -------")
         return temp_dir
-
-
     def request_stop(self):
         """Request the worker to stop after the current iteration."""
         self._stop_requested = True
@@ -212,8 +219,6 @@ class TrackerWorker(QThread):
         if not os.path.exists(sam2_checkpoint):
             self.error.emit(f"Checkpoint not found: {sam2_checkpoint}")
         return model_cfg, sam2_checkpoint
-    
-
     def _get_batch_prompt(self, batch_start_frame):
         pass
         
@@ -382,7 +387,7 @@ class TrackerWorker(QThread):
             print(f"Chosen save_mask_dir: {self.save_mask_dir}")
             print(f"Video name: {video_name}")
 
-            mask_output_dir = os.path.join(self.save_mask_dir, f"{video_name}_masks_{ts}_{self.start_frame}_{self.end_frame if self.end_frame is not None else 'end'}")
+            mask_output_dir = os.path.join(self.save_mask_dir, f"{self.start_frame}_{self.end_frame}_{video_name}_masks_{ts}_{self.start_frame}_{self.end_frame if self.end_frame is not None else 'end'}")
             os.makedirs(mask_output_dir, exist_ok=True)
             print(f"Initialized mask output directory at: {mask_output_dir}")
 
@@ -452,10 +457,8 @@ class TrackerWorker(QThread):
                         #     obj_id=ann_obj_id,
                         #     mask=mask_binary.astype(bool) # Convert back to boolean mask
                         # )
-                        kernel_size = 7
-                        kernel_iterations = 5
-                        kernel = np.ones((kernel_size, kernel_size), np.uint8)
-                        eroded_mask = cv2.erode(mask_binary, kernel, iterations=kernel_iterations)
+                        kernel = np.ones((self.kernel_size, self.kernel_size), np.uint8)
+                        eroded_mask = cv2.erode(mask_binary, kernel, iterations=self.kernel_iterations)
 
                         # Extract centerline
                         skeleton = skeletonize(eroded_mask > 0)
@@ -463,12 +466,10 @@ class TrackerWorker(QThread):
                         
                         # Sample centerline points
                         if len(centerline_points) > 15:
-                            indices = np.linspace(0, len(centerline_points) - 1, 15, dtype=int)
+                            indices = np.linspace(0, len(centerline_points) - 1, self.num_positive_prompts, dtype=int)
                             sampled_points = centerline_points[indices]
-                            
                             # Add centerline as positive points
                             labels = np.ones(len(sampled_points), dtype=np.int32)
-
                         else:
                             sampled_points = centerline_points
                             labels = np.ones(len(sampled_points), dtype=np.int32)
@@ -478,10 +479,8 @@ class TrackerWorker(QThread):
                         if add_negative_points:
                                                     # NEW: Extract negative prompts from the boundary region
                             # Dilate the original (non-eroded) mask to find the outer boundary
-                            negative_kernel_dilate_size = 7
-                            negative_kernel_iterations = 5
-                            kernel_dilate = np.ones((negative_kernel_dilate_size, negative_kernel_dilate_size), np.uint8)
-                            dilated_mask = cv2.dilate(mask_binary, kernel_dilate, iterations=negative_kernel_iterations)
+                            kernel_dilate = np.ones((self.negative_kernel_size, self.negative_kernel_size), np.uint8)
+                            dilated_mask = cv2.dilate(mask_binary, kernel_dilate, iterations=self.negative_kernel_iterations)
                             # Boundary region = dilated - original
                             boundary_region = dilated_mask - mask_binary
                             
@@ -492,7 +491,7 @@ class TrackerWorker(QThread):
                             
                             if len(boundary_pixels) > 0:
                                 # Sample ~10 negative points evenly around the boundary
-                                num_neg_points = min(10, len(boundary_pixels))
+                                num_neg_points = min(self.num_negative_prompts, len(boundary_pixels))
                                 if len(boundary_pixels) > num_neg_points:
                                     neg_indices = np.linspace(0, len(boundary_pixels) - 1, num_neg_points, dtype=int)
                                     negative_points = boundary_pixels[neg_indices]
@@ -788,10 +787,21 @@ class ImageLoader(QThread):
             pass
 
 class C_Elegans_GUI(QMainWindow):
+
     def __init__(self):
         super().__init__()
         self.setWindowTitle("C. Elegans Tracker (SAM 2)")
         self.resize(1000, 800)
+
+        # --- Tracking parameter controls (defaults from config) ---
+        self.kernel_size = KERNEL_SIZE
+        self.kernel_iterations = KERNEL_ITERATIONS
+        self.num_positive_prompts = NUM_POSITIVE_PROMPTS
+        self.negative_kernel_size = NEGATIVE_KERNEL_SIZE
+        self.negative_kernel_iterations = NEGATIVE_KERNEL_ITERATIONS
+        self.num_negative_prompts = NUM_NEGATIVE_PROMPTS
+        self.batch_prompt_overlay = None  # Stores overlay image for batch prompt visualization
+        self.batch_prompt_frame_idx = None  # Frame index for which overlay is valid
 
         # State Variables
         self.video_path = None
@@ -1125,6 +1135,131 @@ class C_Elegans_GUI(QMainWindow):
             self.prompts_by_object[obj_id] = {}
         self.prompts_by_object[obj_id][frame_idx] = prompts
 
+
+    def on_add_prompts_from_mask(self):
+        """Add prompts to the selected object in the current frame based on mask."""
+        idx = self.current_frame_idx
+        mask_path = self.tracking_mask_files.get(idx)
+        if not mask_path or not os.path.exists(mask_path):
+            QMessageBox.warning(self, "No Mask", "No mask found for this frame.")
+            return
+
+        obj_id = self.add_prompt_combo.currentData()
+        if obj_id is None:
+            QMessageBox.warning(self, "No Object", "No object selected.")
+            return
+
+        mask_colour = cv2.imread(mask_path)
+        mask_gray = cv2.cvtColor(mask_colour, cv2.COLOR_BGR2GRAY)
+        mask_binary = np.where(mask_gray > 0, 255, 0).astype(np.uint8)
+
+        # Erode for positive prompts
+        kernel = np.ones((self.kernel_size, self.kernel_size), np.uint8)
+        eroded_mask = cv2.erode(mask_binary, kernel, iterations=self.kernel_iterations)
+
+        # Skeletonize for centerline
+        skeleton = skeletonize(eroded_mask > 0)
+        centerline_points = np.column_stack(np.where(skeleton > 0))[:, ::-1]
+        if len(centerline_points) > 15:
+            indices = np.linspace(0, len(centerline_points) - 1, self.num_positive_prompts, dtype=int)
+            sampled_points = centerline_points[indices]
+        else:
+            sampled_points = centerline_points
+
+        # Dilate for negative prompts
+        kernel_dilate = np.ones((self.negative_kernel_size, self.negative_kernel_size), np.uint8)
+        dilated_mask = cv2.dilate(mask_binary, kernel_dilate, iterations=self.negative_kernel_iterations)
+        boundary_region = dilated_mask - mask_binary
+        boundary_pixels = np.column_stack(np.where(boundary_region > 0))[:, ::-1]
+        negative_points = []
+        if len(boundary_pixels) > 0:
+            num_neg_points = min(self.num_negative_prompts, len(boundary_pixels))
+            if len(boundary_pixels) > num_neg_points:
+                neg_indices = np.linspace(0, len(boundary_pixels) - 1, num_neg_points, dtype=int)
+                negative_points = boundary_pixels[neg_indices]
+            else:
+                negative_points = boundary_pixels
+
+        # Build prompt list
+        prompts = []
+        for pt in sampled_points:
+            prompts.append(((int(pt[0]), int(pt[1])), 1))  # Positive
+        for pt in negative_points:
+            prompts.append(((int(pt[0]), int(pt[1])), 0))  # Negative
+
+        # Set prompts for this object in this frame
+        self.set_prompts_for_object_in_frame(obj_id, idx, prompts)
+        self.update_object_sidebar()
+        self.clear_pixmap_cache()
+        self._image_loader.request(idx)
+        self.update_display()
+        self.status_label.setText(f"Added {len(prompts)} prompts to Object {obj_id+1} for frame {idx}")
+
+
+    def on_calc_batch_prompt(self):
+        """Calculate positive/negative prompts for the current frame based on mask, and prepare overlay."""
+        idx = self.current_frame_idx
+        mask_path = self.tracking_mask_files.get(idx)
+        if not mask_path or not os.path.exists(mask_path):
+            QMessageBox.warning(self, "No Mask", "No mask found for this frame.")
+            return
+
+        mask_colour = cv2.imread(mask_path)
+        mask_gray = cv2.cvtColor(mask_colour, cv2.COLOR_BGR2GRAY)
+        mask_binary = np.where(mask_gray > 0, 255, 0).astype(np.uint8)
+
+        # Erode for positive prompts
+        kernel = np.ones((self.kernel_size, self.kernel_size), np.uint8)
+        eroded_mask = cv2.erode(mask_binary, kernel, iterations=self.kernel_iterations)
+
+        # Skeletonize for centerline
+        skeleton = skeletonize(eroded_mask > 0)
+        centerline_points = np.column_stack(np.where(skeleton > 0))[:, ::-1]
+        if len(centerline_points) > 15:
+            indices = np.linspace(0, len(centerline_points) - 1, self.num_positive_prompts, dtype=int)
+            sampled_points = centerline_points[indices]
+        else:
+            sampled_points = centerline_points
+
+        # Dilate for negative prompts
+        kernel_dilate = np.ones((self.negative_kernel_size, self.negative_kernel_size), np.uint8)
+        dilated_mask = cv2.dilate(mask_binary, kernel_dilate, iterations=self.negative_kernel_iterations)
+        boundary_region = dilated_mask - mask_binary
+        boundary_pixels = np.column_stack(np.where(boundary_region > 0))[:, ::-1]
+        if len(boundary_pixels) > 0:
+            num_neg_points = min(self.num_negative_prompts, len(boundary_pixels))
+            if len(boundary_pixels) > num_neg_points:
+                neg_indices = np.linspace(0, len(boundary_pixels) - 1, num_neg_points, dtype=int)
+                negative_points = boundary_pixels[neg_indices]
+            else:
+                negative_points = boundary_pixels
+        else:
+            negative_points = np.zeros((0, 2), dtype=int)
+
+        # Prepare overlay for visualization
+        img = cv2.imread(self.image_files[idx]) if self.image_files else mask_colour.copy()
+        overlay = img.copy()
+        # Draw eroded mask boundary (green)
+        contours, _ = cv2.findContours(eroded_mask.astype(np.uint8), cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+        cv2.drawContours(overlay, contours, -1, (0, 255, 0), 2)
+        # Draw dilated mask boundary (cyan)
+        contours, _ = cv2.findContours(dilated_mask.astype(np.uint8), cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+        cv2.drawContours(overlay, contours, -1, (255, 255, 0), 2)
+        # Draw positive points (red)
+        for pt in sampled_points:
+            cv2.circle(overlay, (int(pt[0]), int(pt[1])), 6, (0, 0, 255), -1)
+        # Draw negative points (blue)
+        for pt in negative_points:
+            cv2.circle(overlay, (int(pt[0]), int(pt[1])), 6, (255, 0, 0), -1)
+            cv2.line(overlay, (int(pt[0])-5, int(pt[1])-5), (int(pt[0])+5, int(pt[1])+5), (255,0,0), 2)
+            cv2.line(overlay, (int(pt[0])-5, int(pt[1])+5), (int(pt[0])+5, int(pt[1])-5), (255,0,0), 2)
+
+        self.batch_prompt_overlay = overlay
+        self.batch_prompt_frame_idx = idx
+        self.chk_show_batch_prompt.setChecked(True)
+        self.update_display()
+
+
     def create_new_object(self, frame_idx, initial_prompts=None):
         """Create a new object and optionally add initial prompts in a frame.
         Returns the new object_id."""
@@ -1322,6 +1457,85 @@ class C_Elegans_GUI(QMainWindow):
         prompt_size_row_layout.addStretch()
         self.left_layout.addWidget(prompt_size_row_widget)
 
+
+        # --- Parameter controls ---
+        param_group = QWidget()
+        param_layout = QVBoxLayout()
+        param_group.setLayout(param_layout)
+        param_group.setContentsMargins(0, 0, 0, 0)
+
+        # Helper to add a labeled spinbox
+        def add_spinbox(label_text, attr, minv, maxv, step, tooltip=None):
+            row = QWidget()
+            row_layout = QHBoxLayout()
+            row_layout.setContentsMargins(0, 0, 0, 0)
+            row.setLayout(row_layout)
+            label = QLabel(label_text)
+            spin = QSpinBox()
+            spin.setMinimum(minv)
+            spin.setMaximum(maxv)
+            spin.setSingleStep(step)
+            spin.setValue(getattr(self, attr))
+            if tooltip:
+                spin.setToolTip(tooltip)
+            def on_change(val, attr=attr):
+                setattr(self, attr, val)
+            spin.valueChanged.connect(on_change)
+            row_layout.addWidget(label)
+            row_layout.addWidget(spin)
+            param_layout.addWidget(row)
+
+        add_spinbox("Kernel Size", "kernel_size", 1, 31, 1, "Erosion kernel size")
+        add_spinbox("Kernel Iter", "kernel_iterations", 1, 20, 1, "Erosion kernel iterations")
+        add_spinbox("# Pos Prompts", "num_positive_prompts", 1, 100, 1, "Number of positive prompts")
+        add_spinbox("Neg Kernel Size", "negative_kernel_size", 1, 31, 1, "Negative prompt dilation kernel size")
+        add_spinbox("Neg Kernel Iter", "negative_kernel_iterations", 1, 20, 1, "Negative prompt dilation iterations")
+        add_spinbox("# Neg Prompts", "num_negative_prompts", 1, 100, 1, "Number of negative prompts")
+
+        param_layout.addStretch(1)
+        self.sidebar_layout.addWidget(QLabel("Tracking Parameters:"))
+        self.sidebar_layout.addWidget(param_group)
+
+
+        # (after param_group and param_layout.addStretch(1))
+        self.sidebar_layout.addWidget(QLabel("Tracking Parameters:"))
+        self.sidebar_layout.addWidget(param_group)
+
+        # --- Batch Prompt Controls ---
+        batch_prompt_row = QWidget()
+        batch_prompt_layout = QHBoxLayout()
+        batch_prompt_layout.setContentsMargins(0, 0, 0, 0)
+        batch_prompt_row.setLayout(batch_prompt_layout)
+
+        self.btn_calc_batch_prompt = QPushButton("Calculate Batch Prompt")
+        self.btn_calc_batch_prompt.setFixedHeight(28)
+        self.btn_calc_batch_prompt.clicked.connect(self.on_calc_batch_prompt)
+        batch_prompt_layout.addWidget(self.btn_calc_batch_prompt)
+
+        self.chk_show_batch_prompt = QCheckBox("Show Batch Prompt")
+        self.chk_show_batch_prompt.setChecked(False)
+        self.chk_show_batch_prompt.stateChanged.connect(self.update_display)
+        batch_prompt_layout.addWidget(self.chk_show_batch_prompt)
+
+        self.left_layout.addWidget(batch_prompt_row)
+
+        # --- Add Prompts from Mask Controls ---
+        add_prompt_row = QWidget()
+        add_prompt_layout = QHBoxLayout()
+        add_prompt_layout.setContentsMargins(0, 0, 0, 0)
+        add_prompt_row.setLayout(add_prompt_layout)
+
+        self.add_prompt_combo = QComboBox()
+        self.add_prompt_combo.setMinimumWidth(120)
+        self.add_prompt_combo.setToolTip("Select object to add prompts for")
+        add_prompt_layout.addWidget(self.add_prompt_combo)
+
+        self.btn_add_prompts_from_mask = QPushButton("Add Prompts from Mask")
+        self.btn_add_prompts_from_mask.setFixedHeight(28)
+        self.btn_add_prompts_from_mask.clicked.connect(self.on_add_prompts_from_mask)
+        add_prompt_layout.addWidget(self.btn_add_prompts_from_mask)
+
+        self.left_layout.addWidget(add_prompt_row)
 
         # Buttons
         btn_layout = QHBoxLayout()
@@ -1811,6 +2025,12 @@ class C_Elegans_GUI(QMainWindow):
                 num_centerline_points=self.centerline_points_spin.value(),
                 save_mask_dir=mask_output_dir,
                 batch_size=self.batch_size_spin.value(),
+                kernel_size=self.kernel_size,
+                kernel_iterations=self.kernel_iterations,
+                num_positive_prompts=self.num_positive_prompts,
+                negative_kernel_size=self.negative_kernel_size,
+                negative_kernel_iterations=self.negative_kernel_iterations,
+                num_negative_prompts=self.num_negative_prompts,
             )
             print("connecting maskSaved signal")
             self.worker.maskSaved.connect(self._on_mask_saved)
@@ -2555,6 +2775,10 @@ class C_Elegans_GUI(QMainWindow):
         except Exception:
             pass
 
+        self.add_prompt_combo.clear()
+        for obj_id in self.get_all_object_ids():
+            self.add_prompt_combo.addItem(f"Object {obj_id+1}", obj_id)
+
     def on_object_button_clicked(self, obj_id, mode=1):
         """Handle object button click: mark selected object and mode (+ or -)."""
         self.selected_object_idx = obj_id
@@ -2685,6 +2909,18 @@ class C_Elegans_GUI(QMainWindow):
         # Otherwise request the image loader to load this frame (and neighbors via prefetch)
         self._image_loader.request(self.current_frame_idx)
         self._prefetch_neighbors(self.current_frame_idx)
+
+        if getattr(self, 'chk_show_batch_prompt', None) and self.chk_show_batch_prompt.isChecked():
+            if self.batch_prompt_overlay is not None and self.batch_prompt_frame_idx == self.current_frame_idx:
+                img_rgb = cv2.cvtColor(self.batch_prompt_overlay, cv2.COLOR_BGR2RGB)
+                img_rgb = np.ascontiguousarray(img_rgb)
+                h, w, ch = img_rgb.shape
+                bytes_per_line = ch * w
+                q_img = QImage(img_rgb.data, w, h, bytes_per_line, QImage.Format_RGB888)
+                pixmap = QPixmap.fromImage(q_img)
+                scaled_pixmap = pixmap.scaled(self.image_label.size(), Qt.KeepAspectRatio, Qt.SmoothTransformation)
+                self.image_label.setPixmap(scaled_pixmap)
+                return
 
         # Show a lightweight placeholder while loading
         self.image_label.setText("Loading...")

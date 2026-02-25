@@ -29,10 +29,10 @@ elif vid == "RIF_P":
 print(f"Processing video: {vid}")
 # first run tmp.py to consolidate sam1 masks into output_dir
 if sam1_dir:
-    import tmp
+    import SAM2Gui.merge.consolidate as consolidate
     import sys
     sys.argv = ['tmp.py', sam1_dir, output_dir]
-    tmp.main()
+    consolidate.main()
 
 
 # then run merge.py to merge sam2 masks into output_dir, overwriting any duplicates from sam1

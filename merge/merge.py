@@ -58,6 +58,7 @@ def main():
         
         # Read all .jpg files in this subfolder
         jpg_files = [f for f in os.listdir(subfolder_path) if f.endswith('.jpg')]
+        jpg_files.sort(key=lambda x: int(re.search(r'^(\d+)', x).group(1)))  # sort by frame index
         print(f" Found range of frames: {jpg_files[0]} to {jpg_files[-1]} in {subfolder}")
         for filename in tqdm(jpg_files, desc=f"  {subfolder}", leave=False):
             try:
