@@ -166,7 +166,7 @@ class TrackerWorker(QThread):
                 # (so not zero-based)
                 save_path = os.path.join(temp_dir, f"{i}.jpg")
                 cv2.imwrite(save_path, out)
-                print(f"Exported frame {i} to {save_path}")
+                # print(f"Exported frame {i} to {save_path}")
                 frames_processed = i - self.start_frame + 1
                 if frames_processed % max(1, n_frames // 100) == 0:
                     pct = int(100.0 * frames_processed / n_frames)
@@ -422,7 +422,7 @@ class TrackerWorker(QThread):
                         labels = np.array([lbl for _, lbl in prompts], dtype=np.int32)
                         predictor.add_new_points_or_box(
                             inference_state=inference_state,
-                            frame_idx=batch_start_frame,
+                            frame_idx=0,
                             obj_id=ann_obj_id,
                             points=points,
                             labels=labels,
