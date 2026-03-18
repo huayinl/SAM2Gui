@@ -22,6 +22,7 @@ from PyQt5.QtGui import QImage, QPixmap, QPainter, QColor, QPen, QFont
 from queue import Queue, Empty
 from collections import OrderedDict
 from config import *
+import matplotlib.pyplot as plt
 
 # --- Check for SAM 2 ---
 try:
@@ -32,39 +33,96 @@ except ImportError:
     print("Warning: SAM 2 library not found. Tracking will not function.")
 
 def process_image_and_scale_centers(img, downsample_resolution=8, min_area=1000, max_area=50000, min_hole_area=100000, num_skeleton_points=10):
-    # [Exactly as provided in your prompt]
+    """
+    Process the image to create a mask and extract scaled centerline points for SAM 2 prompts.
+
+    Args:
+        img: Input image (numpy array)
+        downsample_resolution: Factor to downsample the image for processing
+        min_area: Minimum area of blobs to keep
+        max_area: Maximum area of blobs to keep
+        min_hole_area: Minimum area of holes to fill in the mask
+        num_skeleton_points: Number of points to sample from the skeleton for prompts
+        LOGGING: Whether to log processing information
+    """
+
+    # Assumption:
+    # input img is a single frame (H, W, C) or (H, W) numpy array
+    # there's a slide with dark worms on a lighter background, 
+    # and an irregular black border around the image that we want to exclude from the mask
+
+    # (1) downsample the image for faster processing
     original_height, original_width = img.shape[:2]
     new_width = original_width // downsample_resolution
     new_height = original_height // downsample_resolution
     
     downsampled_img = cv2.resize(img, (new_width, new_height))
+    if LOGGING:
+        print(f"Original image size: {original_width}x{original_height}")
+        print(f"Downsampled image size: {new_width}x{new_height}")
+        plt.imshow(downsampled_img)
+        plt.title("Downsampled Image")
+        plt.axis('off')
+        plt.show()
+        plt.savefig("debug_downsampled_image.png")
     
     if len(downsampled_img.shape) == 3:
         gray_img = cv2.cvtColor(downsampled_img, cv2.COLOR_BGR2GRAY)
     else:
         gray_img = downsampled_img
+    
+    if LOGGING:
+        plt.imshow(gray_img, cmap='gray')
+        plt.title("Grayscale Image")
+        plt.axis('off')
+        plt.show()
+        plt.savefig("debug_grayscale_image.png")
 
+    # (2) create initial mask using Otsu's thresholding
+    # (worms are black , background is white, and border is also black)
     blurred = cv2.GaussianBlur(gray_img, (5, 5), 0)
     _, initial_mask = cv2.threshold(blurred, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
 
+    if LOGGING:
+        plt.imshow(initial_mask, cmap='gray')
+        plt.title("Initial Mask after Otsu's Thresholding")
+        plt.axis('off')
+        plt.show()
+        plt.savefig("debug_initial_mask.png")
+
+    # (3) use connected components to filter out the dark border and small worm blobs (cut up worms or noise
     inv_mask = 255 - initial_mask
     num_labels, labels, stats, centroids = cv2.connectedComponentsWithStats(inv_mask, connectivity=8)
     filtered_mask = initial_mask.copy()
-    
     for i in range(1, num_labels):
         area = stats[i, cv2.CC_STAT_AREA]
         if area < min_area:
+            # filter out cut up worms and noise
             filtered_mask[labels == i] = 255
         elif area > max_area:
+            # filter out the dark border
             filtered_mask[labels == i] = 255
+    if LOGGING:
+        plt.imshow(filtered_mask, cmap='gray')
+        plt.title("Filtered Mask after Area Thresholding")
+        plt.axis('off')
+        plt.show()
+        plt.savefig("debug_filtered_mask.png")
 
+    # (4) fill holes in the worms (so solid masks for skeletonization)
     filled_mask = filtered_mask.copy()
     num_labels_white, labels_white, stats_white, centroids_white = cv2.connectedComponentsWithStats(filled_mask, connectivity=8)
-    
     for i in range(1, num_labels_white):
         if stats_white[i, cv2.CC_STAT_AREA] < min_hole_area:
             filled_mask[labels_white == i] = 0
+    if LOGGING:
+        plt.imshow(filled_mask, cmap='gray')
+        plt.title("Filled Mask after Hole Filling")
+        plt.axis('off')
+        plt.show()
+        plt.savefig("debug_filled_mask.png")
 
+    # (5) extract skeleton points from the mask for SAM 2 prompts
     mask = filled_mask
     num_labels_blobs, labels_blobs, stats_blobs, centroids_blobs = cv2.connectedComponentsWithStats(255 - mask, connectivity=8)
     blob_centers = []
@@ -86,10 +144,35 @@ def process_image_and_scale_centers(img, downsample_resolution=8, min_area=1000,
                     blob_skeleton_points = [all_points[j] for j in indices]
                 blob_centers.append(blob_skeleton_points)
 
+    if LOGGING:
+        print(f"Found {len(blob_centers)} blobs with area >= {min_area}")
+        plt.imshow(gray_img, cmap='gray')
+        for i, blob_points in enumerate(blob_centers):
+            print(f"Blob {i+1}: {len(blob_points)} skeleton points")
+            plt.scatter([p[0] for p in blob_points], [p[1] for p in blob_points], label=f'Blob {i+1}')
+        plt.title("Extracted Skeleton Points from Blobs")
+        plt.legend()
+        plt.axis('equal')
+        plt.gca().invert_yaxis()
+        plt.show()
+        plt.savefig("debug_blob_skeleton_points.png")
+    
+    # (6) scale the skeleton points back up to the original image resolution for SAM 2 prompts
     scaled_blob_centers = []
     for blob_points in blob_centers:
         scaled_points = [(int(cx * downsample_resolution), int(cy * downsample_resolution)) for cx, cy in blob_points]
         scaled_blob_centers.append(scaled_points)
+    if LOGGING:
+        plt.imshow(img, cmap='gray')
+        for i, blob_points in enumerate(scaled_blob_centers):
+            print(f"Blob {i+1}: {len(blob_points)} scaled skeleton points")
+            plt.scatter([p[0] for p in blob_points], [p[1] for p in blob_points], label=f'Blob {i+1}')
+        plt.title("Skeleton Points for SAM 2 Prompts (Scaled back to original img dimensions)")
+        plt.legend()
+        plt.axis('equal')
+        plt.gca().invert_yaxis()
+        plt.show()
+        plt.savefig("debug_scaled_blob_skeleton_points.png")
     return scaled_blob_centers
 
 # --- Worker Thread for Heavy SAM 2 Processing ---
@@ -100,10 +183,10 @@ class TrackerWorker(QThread):
     maskSaved = pyqtSignal(int, str) # Emits (frame_idx, mask_file_path) when mask is saved
     centerlineComputed = pyqtSignal(int, dict) # Emits (frame_idx, {obj_id: centerline_points})
 
-    def __init__(self, h5_path, device, scaled_blob_centers, colors=None, model_size='base', start_frame=0, end_frame=None, video_name=None, num_centerline_points=100, save_mask_dir="./masks", batch_size=BATCH_SIZE,
+    def __init__(self, video_source, device, scaled_blob_centers, colors=None, model_size=DEFAULT_MODEL_SIZE, start_frame=0, end_frame=None, video_name=None, num_centerline_points=100, save_mask_dir="./masks", batch_size=BATCH_SIZE,
                  kernel_size=None, kernel_iterations=None, num_positive_prompts=None, negative_kernel_size=None, negative_kernel_iterations=None, num_negative_prompts=None):
         super().__init__()
-        self.h5_path = h5_path
+        self.video_source = video_source  # Can be HDF5 file or directory of images
         self.save_mask_dir = save_mask_dir
         self.device = device
         self.scaled_blob_centers = scaled_blob_centers
@@ -131,7 +214,7 @@ class TrackerWorker(QThread):
 
     def create_temp_video_dir_from_h5(self, start_frame, end_frame, dataset_name=None):
         print(f"Creating temporary video directory from HDF5 frames {start_frame} to {end_frame}...")
-        with h5py.File(self.h5_path, 'r') as f:
+        with h5py.File(self.video_source, 'r') as f:
             ds_name = dataset_name
             if ds_name is None:
                 for pref in ('images', 'frames', 'data'):
@@ -184,6 +267,7 @@ class TrackerWorker(QThread):
         print(f"Temporary video directory created at {temp_dir}")
         print("------- Finished exporting frames from HDF5 -------")
         return temp_dir
+    
     def request_stop(self):
         """Request the worker to stop after the current iteration."""
         self._stop_requested = True
@@ -203,7 +287,7 @@ class TrackerWorker(QThread):
             return resampled
 
     def _initialize_model(self):
-        model_size = getattr(self, 'model_size', 'base')
+        model_size = DEFAULT_MODEL_SIZE
         sam2_checkpoint, model_cfg = None, None
         if model_size == 'tiny':
             sam2_checkpoint = "./checkpoints/sam2.1_hiera_tiny.pt"
@@ -219,9 +303,7 @@ class TrackerWorker(QThread):
         if not os.path.exists(sam2_checkpoint):
             self.error.emit(f"Checkpoint not found: {sam2_checkpoint}")
         return model_cfg, sam2_checkpoint
-    def _get_batch_prompt(self, batch_start_frame):
-        pass
-        
+
     def _save_prompt_visualization(self, prompts, temp_video_path, batch_start_frame, output_dir):
         """
         Save a visualization of the prompts being used for this batch.
@@ -375,15 +457,19 @@ class TrackerWorker(QThread):
     
     def run(self):
         """
-        Given a temporary video folder path, runs SAM 2 tracking with the provided prompts.
-        (this temporary video folder is just the selected frames exported from the HDF5 file)
+        Given a video source (HDF5 file or directory of images), runs SAM 2 tracking with the provided prompts.
         """
         try:
             print("Starting run method of TrackerWorker...")
+            
+            # Determine if source is HDF5 or directory
+            is_h5 = os.path.isfile(self.video_source) and self.video_source.endswith(('.h5', '.hdf5'))
+            print(f"Video source is HDF5: {is_h5}")
+            
             # 1. Setup Folders
             # (self.save_mask_dir is either chosen, or the parent dir of the video)
             ts = datetime.now().strftime("%Y%m%d_%H%M%S")
-            video_name = os.path.basename(os.path.normpath(self.h5_path))
+            video_name = os.path.basename(os.path.normpath(self.video_source))
             print(f"Chosen save_mask_dir: {self.save_mask_dir}")
             print(f"Video name: {video_name}")
 
@@ -408,8 +494,14 @@ class TrackerWorker(QThread):
                 batch_num = (batch_start_frame - self.start_frame) // self.batch_size
                 print(f"Processing batch {batch_num + 1}: frames {batch_start_frame} to {batch_end_frame}")
 
-                # Export temporary video segment for the current batch
-                temp_video_path = self.create_temp_video_dir_from_h5(batch_start_frame, batch_end_frame)
+                # Export temporary video segment for the current batch (only if HDF5)
+                if is_h5:
+                    temp_video_path = self.create_temp_video_dir_from_h5(batch_start_frame, batch_end_frame)
+                    created_temp_dir = True
+                else:
+                    # Use directory directly for image folders
+                    temp_video_path = self.video_source
+                    created_temp_dir = False
 
                 # Reinitialize inference state for each batch (to avoid memory issues)
                 inference_state = predictor.init_state(video_path=temp_video_path)
@@ -622,6 +714,15 @@ class TrackerWorker(QThread):
                     self.maskSaved.emit(save_frame_index, save_path)
                     self.centerlineComputed.emit(save_frame_index, frame_centerlines)
 
+                # Cleanup temporary directory only if it was created from HDF5
+                if created_temp_dir and temp_video_path and os.path.exists(temp_video_path):
+                    try:
+                        import shutil
+                        shutil.rmtree(temp_video_path)
+                        print(f"Cleaned up temporary directory: {temp_video_path}")
+                    except Exception as cleanup_error:
+                        print(f"Warning: Failed to cleanup temp directory {temp_video_path}: {cleanup_error}")
+
                 print(f"Finished processing batch {batch_num + 1}")
                 batch_start_frame += self.batch_size
             # Save all centerlines to numpy file
@@ -650,12 +751,15 @@ class ImageLoader(QThread):
         super().__init__(parent)
         self._req_q = Queue()
         self._running = True
+
         # references (set by GUI) to lists/dicts owned by GUI
         self.image_files = None
         self.mask_files = None
+
         # optional HDF5 reference
         self.h5_path = None
         self.h5_dataset = None
+
         # internal HDF5 handle opened in this thread (open once for efficiency)
         self._h5f = None
         self._h5_n_frames = None
@@ -1496,11 +1600,6 @@ class C_Elegans_GUI(QMainWindow):
         self.sidebar_layout.addWidget(QLabel("Tracking Parameters:"))
         self.sidebar_layout.addWidget(param_group)
 
-
-        # (after param_group and param_layout.addStretch(1))
-        self.sidebar_layout.addWidget(QLabel("Tracking Parameters:"))
-        self.sidebar_layout.addWidget(param_group)
-
         # --- Batch Prompt Controls ---
         batch_prompt_row = QWidget()
         batch_prompt_layout = QHBoxLayout()
@@ -1615,8 +1714,8 @@ class C_Elegans_GUI(QMainWindow):
         controls_layout.addWidget(QLabel("Model:"))
         self.model_combo = QComboBox()
         self.model_combo.addItems(["tiny", "base", "large"])
-        # default to 'base'
-        self.model_combo.setCurrentText("base")
+        self.model_size = DEFAULT_MODEL_SIZE
+        self.model_combo.setCurrentText(DEFAULT_MODEL_SIZE.lower())
         self.model_combo.currentTextChanged.connect(lambda v: setattr(self, 'model_size', v))
         controls_layout.addWidget(self.model_combo)
 
@@ -1803,11 +1902,13 @@ class C_Elegans_GUI(QMainWindow):
         # Run user's logic
         try:
             prompts = process_image_and_scale_centers(img, downsample_resolution=8, num_skeleton_points=10)
+            
             # store prompts as separate objects (one per detected worm)
             # wrap each coordinate as ((x, y), 1) for positive prompts
             for i, skeleton_pts in enumerate(prompts):
                 labeled_prompts = [((x, y), 1) for x, y in skeleton_pts]
                 self.create_new_object(target_idx, labeled_prompts)
+            
             # mark which frame these prompts belong to
             self.autoseg_frame_idx = target_idx
 
@@ -1933,46 +2034,36 @@ class C_Elegans_GUI(QMainWindow):
             self.status_label.setText("Error in segmentation.")
 
     def run_tracking(self):
+        if LOGGING:
+            print("------- Running Tracking... -------")
+
         if not SAM2_AVAILABLE:
             QMessageBox.critical(self, "Error", "SAM 2 library is not installed/importable.")
             return
 
-        # If dataset was loaded from HDF5, export frames to a temporary folder first
-        if getattr(self, 'h5_file_path', None) is not None:
-            # check that prompts exist for requested start frame before exporting
-            try:
-                start_frame = int(self.start_spin.value()) if hasattr(self, 'start_spin') else 0
-            except Exception:
-                start_frame = 0
-            # Check if any object has prompts in the start frame
-            start_frame_has_prompts = any(
-                len(self.get_prompts_for_object_in_frame(obj_id, start_frame)) > 0 
-                for obj_id in self.get_all_object_ids()
-            )
-            if not start_frame_has_prompts:
-                QMessageBox.critical(self, "Error", "No prompts for chosen start frame. Please add some prompts.")
-                return
-            
-            try:
-                end_frame = int(self.end_spin.value()) if hasattr(self, 'end_spin') else None
-            except Exception:
-                end_frame = None
-            
-            # Start TrackerWorker with HDF5 export integrated
-            print("------- Exporting frames from HDF5 for tracking...")
-            self._start_tracker_worker(start_frame=start_frame, end_frame=end_frame)
-
-        # determine requested frame range from spinboxes (if present)
+        # check that prompts exist for requested start frame before exporting
         try:
             start_frame = int(self.start_spin.value()) if hasattr(self, 'start_spin') else 0
-            end_frame = int(self.end_spin.value()) if hasattr(self, 'end_spin') else None
-        except Exception:
+        except Exception as e:
+            print(f"Error reading start frame: {e}, setting start_frame to 0")
             start_frame = 0
+            
+        # Check if any object has prompts in the start frame
+        start_frame_has_prompts = any(
+            len(self.get_prompts_for_object_in_frame(obj_id, start_frame)) > 0 
+            for obj_id in self.get_all_object_ids()
+        )
+        if not start_frame_has_prompts:
+            QMessageBox.critical(self, "Error", "No prompts for chosen start frame. Please add some prompts.")
+            return
+        
+        try:
+            end_frame = int(self.end_spin.value()) if hasattr(self, 'end_spin') else None
+        except Exception as e:
+            print(f"Error reading end frame: {e}, setting end_frame to None")
             end_frame = None
 
-        # # normal folder-based tracking
-        # print(f"Normal folder-based tracking from frame {start_frame} to {end_frame}")
-        # self._start_tracker_worker(start_frame=start_frame, end_frame=end_frame)
+        self._start_tracker_worker(start_frame=start_frame, end_frame=end_frame)
 
     def stop_tracking(self):
         """Request an early stop for ongoing tracking."""
@@ -2014,11 +2105,11 @@ class C_Elegans_GUI(QMainWindow):
             print(f"h5 file path: {getattr(self, 'h5_file_path', None)}")
             # Start tracker worker
             self.worker = TrackerWorker(
-                self.h5_file_path if getattr(self, 'h5_file_path', None) is not None else self.video_path,
+                getattr(self, 'h5_file_path', None) or self.video_path,
                 self.device,
                 prompts,
                 colors=self.colors,
-                model_size=getattr(self, 'model_size', 'base'),
+                model_size=self.model_size,
                 start_frame=start_frame,
                 end_frame=end_frame,
                 video_name=video_name,
