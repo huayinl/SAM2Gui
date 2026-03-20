@@ -6,6 +6,7 @@ import torch
 from skimage.morphology import skeletonize
 import tempfile
 import shutil
+import gc
 from datetime import datetime
 from tqdm import tqdm
 try:
@@ -16,7 +17,7 @@ except Exception:
     H5PY_AVAILABLE = False
 from PyQt5.QtWidgets import (QApplication, QMainWindow, QWidget, QVBoxLayout, 
                              QHBoxLayout, QPushButton, QLabel, QFileDialog, 
-                             QStackedWidget, QSlider, QMessageBox, QProgressBar, QComboBox, QScrollArea, QSpinBox, QCheckBox, QAction)
+                             QStackedWidget, QSlider, QMessageBox, QProgressBar, QComboBox, QScrollArea, QSpinBox, QCheckBox, QAction, QSplitter)
 from PyQt5.QtCore import Qt, QThread, pyqtSignal, QTimer, QEvent
 from PyQt5.QtGui import QImage, QPixmap, QPainter, QColor, QPen, QFont
 from queue import Queue, Empty
@@ -904,8 +905,6 @@ class C_Elegans_GUI(QMainWindow):
         self.negative_kernel_size = NEGATIVE_KERNEL_SIZE
         self.negative_kernel_iterations = NEGATIVE_KERNEL_ITERATIONS
         self.num_negative_prompts = NUM_NEGATIVE_PROMPTS
-        self.batch_prompt_overlay = None  # Stores overlay image for batch prompt visualization
-        self.batch_prompt_frame_idx = None  # Frame index for which overlay is valid
 
         # State Variables
         self.video_path = None
@@ -979,6 +978,8 @@ class C_Elegans_GUI(QMainWindow):
 
         self.setup_selection_screen()
         self.setup_tracking_screen()
+        self.apply_professional_purple_theme()
+        self._apply_clickable_cursors()
 
         # Background image loader thread
         self._image_loader = ImageLoader(self)
@@ -988,6 +989,27 @@ class C_Elegans_GUI(QMainWindow):
         self._image_loader.set_references(self.image_files, self.tracking_mask_files, gui_instance=self)
         # temp dir used when exporting HDF5 frames for tracking
         self._h5_export_tempdir = None
+
+    def apply_professional_purple_theme(self):
+        """Apply a cohesive purple theme to the full application UI."""
+        stylesheet_path = os.path.join(os.path.dirname(__file__), "styles", "purple_theme.qss")
+        try:
+            with open(stylesheet_path, "r", encoding="utf-8") as f:
+                self.setStyleSheet(f.read())
+        except Exception as e:
+            # Keep app functional even if theme file is missing.
+            print(f"Warning: Failed to load stylesheet {stylesheet_path}: {e}")
+
+    def _apply_clickable_cursors(self):
+        """Set pointing-hand cursor for interactive controls."""
+        for btn in self.findChildren(QPushButton):
+            btn.setCursor(Qt.PointingHandCursor)
+        for chk in self.findChildren(QCheckBox):
+            chk.setCursor(Qt.PointingHandCursor)
+        for combo in self.findChildren(QComboBox):
+            combo.setCursor(Qt.PointingHandCursor)
+        for slider in self.findChildren(QSlider):
+            slider.setCursor(Qt.PointingHandCursor)
 
     def _reset_state_for_new_video(self):
         """Clear all UI state, caches, and loader refs before loading a new source."""
@@ -1106,11 +1128,14 @@ class C_Elegans_GUI(QMainWindow):
 
     def setup_selection_screen(self):
         self.selection_widget = QWidget()
+        self.selection_widget.setObjectName("SelectionCard")
         layout = QVBoxLayout()
         layout.setAlignment(Qt.AlignCenter)
+        layout.setContentsMargins(28, 28, 28, 28)
 
         label = QLabel("Please select the folder containing your video frames (0.jpg, 1.jpg...)")
-        label.setStyleSheet("font-size: 18px; margin-bottom: 20px;")
+        label.setObjectName("SectionTitle")
+        label.setWordWrap(True)
         
         btn_select = QPushButton("Select Video Folder")
         btn_select.setFixedSize(200, 50)
@@ -1299,71 +1324,6 @@ class C_Elegans_GUI(QMainWindow):
         self.update_display()
         self.status_label.setText(f"Added {len(prompts)} prompts to Object {obj_id+1} for frame {idx}")
 
-
-    def on_calc_batch_prompt(self):
-        """Calculate positive/negative prompts for the current frame based on mask, and prepare overlay."""
-        idx = self.current_frame_idx
-        mask_path = self.tracking_mask_files.get(idx)
-        if not mask_path or not os.path.exists(mask_path):
-            QMessageBox.warning(self, "No Mask", "No mask found for this frame.")
-            return
-
-        mask_colour = cv2.imread(mask_path)
-        mask_gray = cv2.cvtColor(mask_colour, cv2.COLOR_BGR2GRAY)
-        mask_binary = np.where(mask_gray > 0, 255, 0).astype(np.uint8)
-
-        # Erode for positive prompts
-        kernel = np.ones((self.kernel_size, self.kernel_size), np.uint8)
-        eroded_mask = cv2.erode(mask_binary, kernel, iterations=self.kernel_iterations)
-
-        # Skeletonize for centerline
-        skeleton = skeletonize(eroded_mask > 0)
-        centerline_points = np.column_stack(np.where(skeleton > 0))[:, ::-1]
-        if len(centerline_points) > 15:
-            indices = np.linspace(0, len(centerline_points) - 1, self.num_positive_prompts, dtype=int)
-            sampled_points = centerline_points[indices]
-        else:
-            sampled_points = centerline_points
-
-        # Dilate for negative prompts
-        kernel_dilate = np.ones((self.negative_kernel_size, self.negative_kernel_size), np.uint8)
-        dilated_mask = cv2.dilate(mask_binary, kernel_dilate, iterations=self.negative_kernel_iterations)
-        boundary_region = dilated_mask - mask_binary
-        boundary_pixels = np.column_stack(np.where(boundary_region > 0))[:, ::-1]
-        if len(boundary_pixels) > 0:
-            num_neg_points = min(self.num_negative_prompts, len(boundary_pixels))
-            if len(boundary_pixels) > num_neg_points:
-                neg_indices = np.linspace(0, len(boundary_pixels) - 1, num_neg_points, dtype=int)
-                negative_points = boundary_pixels[neg_indices]
-            else:
-                negative_points = boundary_pixels
-        else:
-            negative_points = np.zeros((0, 2), dtype=int)
-
-        # Prepare overlay for visualization
-        img = cv2.imread(self.image_files[idx]) if self.image_files else mask_colour.copy()
-        overlay = img.copy()
-        # Draw eroded mask boundary (green)
-        contours, _ = cv2.findContours(eroded_mask.astype(np.uint8), cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
-        cv2.drawContours(overlay, contours, -1, (0, 255, 0), 2)
-        # Draw dilated mask boundary (cyan)
-        contours, _ = cv2.findContours(dilated_mask.astype(np.uint8), cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
-        cv2.drawContours(overlay, contours, -1, (255, 255, 0), 2)
-        # Draw positive points (red)
-        for pt in sampled_points:
-            cv2.circle(overlay, (int(pt[0]), int(pt[1])), 6, (0, 0, 255), -1)
-        # Draw negative points (blue)
-        for pt in negative_points:
-            cv2.circle(overlay, (int(pt[0]), int(pt[1])), 6, (255, 0, 0), -1)
-            cv2.line(overlay, (int(pt[0])-5, int(pt[1])-5), (int(pt[0])+5, int(pt[1])+5), (255,0,0), 2)
-            cv2.line(overlay, (int(pt[0])-5, int(pt[1])+5), (int(pt[0])+5, int(pt[1])-5), (255,0,0), 2)
-
-        self.batch_prompt_overlay = overlay
-        self.batch_prompt_frame_idx = idx
-        self.chk_show_batch_prompt.setChecked(True)
-        self.update_display()
-
-
     def create_new_object(self, frame_idx, initial_prompts=None):
         """Create a new object and optionally add initial prompts in a frame.
         Returns the new object_id."""
@@ -1377,23 +1337,26 @@ class C_Elegans_GUI(QMainWindow):
     def setup_tracking_screen(self):
         self.tracking_widget = QWidget()
         layout = QVBoxLayout()
+        layout.setContentsMargins(12, 12, 12, 12)
+        layout.setSpacing(10)
 
         # Image Display Area
         # Left: Image display
         self.image_label = QLabel("No Image Loaded")
+        self.image_label.setObjectName("VideoCanvas")
         self.image_label.setAlignment(Qt.AlignCenter)
         self.image_label.setMinimumSize(640, 480)
-        self.image_label.setStyleSheet("background-color: #222;")
 
         # Right: Sidebar for object buttons
         self.sidebar_area = QScrollArea()
+        self.sidebar_area.setObjectName("RightSidebarCard")
         self.sidebar_area.setWidgetResizable(True)
         self.sidebar_content = QWidget()
         self.sidebar_layout = QVBoxLayout()
         self.sidebar_layout.setAlignment(Qt.AlignTop)
         self.sidebar_content.setLayout(self.sidebar_layout)
         self.sidebar_area.setWidget(self.sidebar_content)
-        self.sidebar_area.setFixedWidth(240)
+        self.sidebar_area.setMinimumWidth(180)
 
         # Container for object buttons (will be populated after autoseg)
         self.object_button_container = QWidget()
@@ -1401,7 +1364,9 @@ class C_Elegans_GUI(QMainWindow):
         self.object_button_layout.setAlignment(Qt.AlignTop)
         self.object_button_container.setLayout(self.object_button_layout)
         # put a title label at top
-        self.sidebar_layout.addWidget(QLabel("Objects:"))
+        objects_label = QLabel("Objects")
+        objects_label.setObjectName("SectionTitle")
+        self.sidebar_layout.addWidget(objects_label)
         self.sidebar_layout.addWidget(self.object_button_container)
 
         # enable mouse events on the image label and install event filter for clicks
@@ -1411,9 +1376,12 @@ class C_Elegans_GUI(QMainWindow):
         # Place image and sidebar side-by-side
         # Left: control sidebar (track buttons + start/end frame)
         self.left_sidebar = QWidget()
+        self.left_sidebar.setObjectName("LeftSidebarCard")
         self.left_layout = QVBoxLayout()
         self.left_layout.setAlignment(Qt.AlignTop)
+        self.left_layout.setContentsMargins(12, 12, 12, 12)
         self.left_sidebar.setLayout(self.left_layout)
+        self.left_sidebar.setMinimumWidth(220)
 
         # Mask output directory row
         mask_dir_widget = QWidget()
@@ -1423,7 +1391,7 @@ class C_Elegans_GUI(QMainWindow):
         mask_dir_layout.addWidget(QLabel("Mask Output Dir:"))
         self.mask_dir_label = QLabel(self.save_mask_dir)
         self.mask_dir_label.setWordWrap(True)
-        self.mask_dir_label.setStyleSheet("font-size: 9px; color: #888;")
+        self.mask_dir_label.setStyleSheet("font-size: 10px; color: #4b5563;")
         mask_dir_layout.addWidget(self.mask_dir_label)
         btn_choose_mask_dir = QPushButton("Browse...")
         btn_choose_mask_dir.setFixedHeight(28)
@@ -1439,14 +1407,16 @@ class C_Elegans_GUI(QMainWindow):
         parent_dir_checkbox_layout.addWidget(self.use_parent_dir_checkbox)
         self.parent_dir_label_text = QLabel("use parent dir: (no video loaded)")
         self.parent_dir_label_text.setWordWrap(True)
-        self.parent_dir_label_text.setStyleSheet("font-size: 9px;")
+        self.parent_dir_label_text.setStyleSheet("font-size: 10px; color: #4b5563;")
         parent_dir_checkbox_layout.addWidget(self.parent_dir_label_text)
         mask_dir_layout.addLayout(parent_dir_checkbox_layout)
         
         self.left_layout.addWidget(mask_dir_widget)
         self.left_layout.addSpacing(10)
 
-        self.left_layout.addWidget(QLabel("Tracking Range:"))
+        tracking_range_label = QLabel("Tracking Range")
+        tracking_range_label.setObjectName("SectionTitle")
+        self.left_layout.addWidget(tracking_range_label)
         
         # Start frame row
         start_row_widget = QWidget()
@@ -1460,7 +1430,7 @@ class C_Elegans_GUI(QMainWindow):
         self.start_spin.setValue(0)
         start_row_layout.addWidget(self.start_spin)
         btn_set_start = QPushButton("Set to Curr")
-        btn_set_start.setFixedWidth(80)
+        btn_set_start.setFixedWidth(110)
         btn_set_start.clicked.connect(lambda: self.start_spin.setValue(self.current_frame_idx))
         start_row_layout.addWidget(btn_set_start)
         start_row_layout.addStretch()
@@ -1478,7 +1448,7 @@ class C_Elegans_GUI(QMainWindow):
         self.end_spin.setValue(0)
         end_row_layout.addWidget(self.end_spin)
         btn_set_end = QPushButton("Set to Curr")
-        btn_set_end.setFixedWidth(80)
+        btn_set_end.setFixedWidth(110)
         btn_set_end.clicked.connect(lambda: self.end_spin.setValue(self.current_frame_idx))
         end_row_layout.addWidget(btn_set_end)
         end_row_layout.addStretch()
@@ -1597,26 +1567,10 @@ class C_Elegans_GUI(QMainWindow):
         add_spinbox("# Neg Prompts", "num_negative_prompts", 1, 100, 1, "Number of negative prompts")
 
         param_layout.addStretch(1)
-        self.sidebar_layout.addWidget(QLabel("Tracking Parameters:"))
+        param_label = QLabel("Tracking Parameters")
+        param_label.setObjectName("SectionTitle")
+        self.sidebar_layout.addWidget(param_label)
         self.sidebar_layout.addWidget(param_group)
-
-        # --- Batch Prompt Controls ---
-        batch_prompt_row = QWidget()
-        batch_prompt_layout = QHBoxLayout()
-        batch_prompt_layout.setContentsMargins(0, 0, 0, 0)
-        batch_prompt_row.setLayout(batch_prompt_layout)
-
-        self.btn_calc_batch_prompt = QPushButton("Calculate Batch Prompt")
-        self.btn_calc_batch_prompt.setFixedHeight(28)
-        self.btn_calc_batch_prompt.clicked.connect(self.on_calc_batch_prompt)
-        batch_prompt_layout.addWidget(self.btn_calc_batch_prompt)
-
-        self.chk_show_batch_prompt = QCheckBox("Show Batch Prompt")
-        self.chk_show_batch_prompt.setChecked(False)
-        self.chk_show_batch_prompt.stateChanged.connect(self.update_display)
-        batch_prompt_layout.addWidget(self.chk_show_batch_prompt)
-
-        self.left_layout.addWidget(batch_prompt_row)
 
         # --- Add Prompts from Mask Controls ---
         add_prompt_row = QWidget()
@@ -1658,8 +1612,9 @@ class C_Elegans_GUI(QMainWindow):
 
         # Create vertical opacity slider
         opacity_slider_widget = QWidget()
+        opacity_slider_widget.setObjectName("OpacityCard")
         opacity_slider_layout = QVBoxLayout()
-        opacity_slider_layout.setContentsMargins(0, 0, 0, 0)
+        opacity_slider_layout.setContentsMargins(8, 10, 8, 10)
         opacity_slider_layout.addWidget(QLabel("Mask\nOpacity"), alignment=Qt.AlignHCenter)
         self.mask_opacity_slider = QSlider(Qt.Vertical)
         self.mask_opacity_slider.setMinimum(0)
@@ -1673,12 +1628,24 @@ class C_Elegans_GUI(QMainWindow):
         opacity_slider_layout.addWidget(self.mask_opacity_label)
         opacity_slider_widget.setLayout(opacity_slider_layout)
 
-        top_hlayout = QHBoxLayout()
-        top_hlayout.addWidget(self.left_sidebar)
-        top_hlayout.addWidget(self.image_label, stretch=1)
-        top_hlayout.addWidget(opacity_slider_widget)
-        top_hlayout.addWidget(self.sidebar_area)
-        layout.addLayout(top_hlayout)
+        center_widget = QWidget()
+        center_layout = QHBoxLayout()
+        center_layout.setContentsMargins(0, 0, 0, 0)
+        center_layout.setSpacing(8)
+        center_layout.addWidget(self.image_label, stretch=1)
+        center_layout.addWidget(opacity_slider_widget)
+        center_widget.setLayout(center_layout)
+
+        self.main_splitter = QSplitter(Qt.Horizontal)
+        self.main_splitter.setChildrenCollapsible(False)
+        self.main_splitter.addWidget(self.left_sidebar)
+        self.main_splitter.addWidget(center_widget)
+        self.main_splitter.addWidget(self.sidebar_area)
+        self.main_splitter.setStretchFactor(0, 0)
+        self.main_splitter.setStretchFactor(1, 1)
+        self.main_splitter.setStretchFactor(2, 0)
+        self.main_splitter.setSizes([300, 900, 260])
+        layout.addWidget(self.main_splitter)
 
         # Controls
         controls_layout = QHBoxLayout()
@@ -2869,6 +2836,7 @@ class C_Elegans_GUI(QMainWindow):
         self.add_prompt_combo.clear()
         for obj_id in self.get_all_object_ids():
             self.add_prompt_combo.addItem(f"Object {obj_id+1}", obj_id)
+        self._apply_clickable_cursors()
 
     def on_object_button_clicked(self, obj_id, mode=1):
         """Handle object button click: mark selected object and mode (+ or -)."""
@@ -3000,18 +2968,6 @@ class C_Elegans_GUI(QMainWindow):
         # Otherwise request the image loader to load this frame (and neighbors via prefetch)
         self._image_loader.request(self.current_frame_idx)
         self._prefetch_neighbors(self.current_frame_idx)
-
-        if getattr(self, 'chk_show_batch_prompt', None) and self.chk_show_batch_prompt.isChecked():
-            if self.batch_prompt_overlay is not None and self.batch_prompt_frame_idx == self.current_frame_idx:
-                img_rgb = cv2.cvtColor(self.batch_prompt_overlay, cv2.COLOR_BGR2RGB)
-                img_rgb = np.ascontiguousarray(img_rgb)
-                h, w, ch = img_rgb.shape
-                bytes_per_line = ch * w
-                q_img = QImage(img_rgb.data, w, h, bytes_per_line, QImage.Format_RGB888)
-                pixmap = QPixmap.fromImage(q_img)
-                scaled_pixmap = pixmap.scaled(self.image_label.size(), Qt.KeepAspectRatio, Qt.SmoothTransformation)
-                self.image_label.setPixmap(scaled_pixmap)
-                return
 
         # Show a lightweight placeholder while loading
         self.image_label.setText("Loading...")
