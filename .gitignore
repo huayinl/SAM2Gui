@@ -8,3 +8,4 @@ checkpoints/*.pt
 .DS_Store
 merge
 __pycache__
+segment_anything_2
