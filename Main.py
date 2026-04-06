@@ -184,7 +184,7 @@ class TrackerWorker(QThread):
     maskSaved = pyqtSignal(int, str) # Emits (frame_idx, mask_file_path) when mask is saved
     centerlineComputed = pyqtSignal(int, dict) # Emits (frame_idx, {obj_id: centerline_points})
 
-    def __init__(self, video_source, device, scaled_blob_centers, colors=None, model_size=DEFAULT_MODEL_SIZE, start_frame=0, end_frame=None, video_name=None, num_centerline_points=100, save_mask_dir="./masks", batch_size=BATCH_SIZE,
+    def __init__(self, video_source, device, scaled_blob_centers, colors=None, model_size=DEFAULT_MODEL_SIZE, checkpoint_path=None, start_frame=0, end_frame=None, video_name=None, num_centerline_points=100, save_mask_dir="./masks", batch_size=BATCH_SIZE,
                  kernel_size=None, kernel_iterations=None, num_positive_prompts=None, negative_kernel_size=None, negative_kernel_iterations=None, num_negative_prompts=None):
         super().__init__()
         self.video_source = video_source  # Can be HDF5 file or directory of images
@@ -192,6 +192,7 @@ class TrackerWorker(QThread):
         self.device = device
         self.scaled_blob_centers = scaled_blob_centers
         self.model_size = model_size
+        self.checkpoint_path = checkpoint_path
         self.start_frame = int(start_frame) if start_frame is not None else 0
         self.end_frame = int(end_frame) if end_frame is not None else None
         self.video_name = video_name  # Store video_name (h5_file_path or video folder name)
@@ -288,16 +289,21 @@ class TrackerWorker(QThread):
             return resampled
 
     def _initialize_model(self):
-        model_size = DEFAULT_MODEL_SIZE
+        model_size = self.model_size
         sam2_checkpoint, model_cfg = None, None
+        if self.checkpoint_path:
+            sam2_checkpoint = self.checkpoint_path
         if model_size == 'tiny':
-            sam2_checkpoint = "./checkpoints/sam2.1_hiera_tiny.pt"
+            if not sam2_checkpoint:
+                sam2_checkpoint = "./checkpoints/sam2.1_hiera_tiny.pt"
             model_cfg = "configs/sam2.1/sam2.1_hiera_t.yaml"
         elif model_size == 'base':
-            sam2_checkpoint = "./checkpoints/sam2.1_hiera_base_plus.pt"
+            if not sam2_checkpoint:
+                sam2_checkpoint = "./checkpoints/sam2.1_hiera_base_plus.pt"
             model_cfg = "configs/sam2.1/sam2.1_hiera_b+.yaml"
         elif model_size == 'large':
-            sam2_checkpoint = "./checkpoints/sam2.1_hiera_large.pt"
+            if not sam2_checkpoint:
+                sam2_checkpoint = "./checkpoints/sam2.1_hiera_large.pt"
             model_cfg = "configs/sam2.1/sam2.1_hiera_l.yaml"
         else:
             self.error.emit(f"Unknown model size: {model_size}")
@@ -930,7 +936,7 @@ class C_Elegans_GUI(QMainWindow):
         # Mask opacity (0.0 to 1.0, where 1.0 = fully opaque)
         self.mask_opacity = 0.5
         # Prompt point size for visualization
-        self.prompt_point_size = 5
+        self.prompt_point_size = 5.0
         # Simple in-memory cache for recently-used color masks to speed up display
         self._mask_cache = {}
         self._mask_cache_max = 64
@@ -978,7 +984,7 @@ class C_Elegans_GUI(QMainWindow):
 
         self.setup_selection_screen()
         self.setup_tracking_screen()
-        self.apply_professional_purple_theme()
+        # self.apply_professional_purple_theme()
         self._apply_clickable_cursors()
 
         # Background image loader thread
@@ -1521,13 +1527,15 @@ class C_Elegans_GUI(QMainWindow):
         prompt_size_row_layout.setContentsMargins(0, 0, 0, 0)
         prompt_size_row_widget.setLayout(prompt_size_row_layout)
         prompt_size_row_layout.addWidget(QLabel("Prompt Size:"))
-        self.prompt_size_spin = QSpinBox()
-        self.prompt_size_spin.setMinimum(1)
-        self.prompt_size_spin.setMaximum(50)
-        self.prompt_size_spin.setValue(5)
-        self.prompt_size_spin.setFixedWidth(60)
-        self.prompt_size_spin.valueChanged.connect(self._on_prompt_size_changed)
-        prompt_size_row_layout.addWidget(self.prompt_size_spin)
+        self.prompt_size_slider = QSlider(Qt.Horizontal)
+        self.prompt_size_slider.setMinimum(1)
+        self.prompt_size_slider.setMaximum(500)
+        self.prompt_size_slider.setValue(50)
+        self.prompt_size_slider.setFixedWidth(100)
+        self.prompt_size_value_label = QLabel("5.0")
+        self.prompt_size_slider.valueChanged.connect(self._on_prompt_size_changed)
+        prompt_size_row_layout.addWidget(self.prompt_size_slider)
+        prompt_size_row_layout.addWidget(self.prompt_size_value_label)
         prompt_size_row_layout.addStretch()
         self.left_layout.addWidget(prompt_size_row_widget)
 
@@ -1677,14 +1685,16 @@ class C_Elegans_GUI(QMainWindow):
         self.btn_play.setEnabled(False)
         controls_layout.addWidget(self.btn_play)
 
-        # Model size selector
-        controls_layout.addWidget(QLabel("Model:"))
-        self.model_combo = QComboBox()
-        self.model_combo.addItems(["tiny", "base", "large"])
+        # Checkpoint selector (model size derived automatically from filename)
         self.model_size = DEFAULT_MODEL_SIZE
-        self.model_combo.setCurrentText(DEFAULT_MODEL_SIZE.lower())
-        self.model_combo.currentTextChanged.connect(lambda v: setattr(self, 'model_size', v))
-        controls_layout.addWidget(self.model_combo)
+        self.checkpoint_path = None
+        controls_layout.addWidget(QLabel("Checkpoint:"))
+        self.checkpoint_label = QLabel(DEFAULT_MODEL_SIZE)
+        self.checkpoint_label.setToolTip("No checkpoint selected — using default")
+        controls_layout.addWidget(self.checkpoint_label)
+        btn_checkpoint = QPushButton("Browse...")
+        btn_checkpoint.clicked.connect(self._choose_checkpoint)
+        controls_layout.addWidget(btn_checkpoint)
 
         layout.addLayout(controls_layout)
 
@@ -1699,6 +1709,25 @@ class C_Elegans_GUI(QMainWindow):
 
         self.tracking_widget.setLayout(layout)
         self.stacked_widget.addWidget(self.tracking_widget)
+
+    def _choose_checkpoint(self):
+        path, _ = QFileDialog.getOpenFileName(self, "Select Checkpoint", "./checkpoints", "Checkpoint (*.pt)")
+        if not path:
+            return
+        name = os.path.basename(path).lower()
+        if 'tiny' in name:
+            size = 'tiny'
+        elif 'large' in name:
+            size = 'large'
+        elif 'base' in name or 'small' in name:
+            size = 'base'
+        else:
+            QMessageBox.warning(self, "Unknown checkpoint", f"Could not determine model size from '{os.path.basename(path)}'. Expected 'tiny', 'small'/'base', or 'large' in the filename.")
+            return
+        self.checkpoint_path = path
+        self.model_size = size
+        self.checkpoint_label.setText(os.path.basename(path))
+        self.checkpoint_label.setToolTip(path)
 
     def choose_folder(self):
         folder = QFileDialog.getExistingDirectory(self, "Select Video Directory")
@@ -1826,8 +1855,9 @@ class C_Elegans_GUI(QMainWindow):
             pass
 
     def _on_prompt_size_changed(self, value):
-        """Handle prompt point size spinbox changes - redraw prompts."""
-        self.prompt_point_size = value
+        """Handle prompt point size slider changes - redraw prompts."""
+        self.prompt_point_size = value / 10.0
+        self.prompt_size_value_label.setText(f"{self.prompt_point_size:.1f}")
         # Clear pixmap cache so prompts get redrawn with new size
         self.clear_pixmap_cache()
         # Request reload of current frame to show new size immediately
@@ -1900,8 +1930,8 @@ class C_Elegans_GUI(QMainWindow):
             try:
                 # draw on a copy (BGR) so we can show markers immediately without waiting for the loader
                 img_bgr = img.copy()
-                circle_radius = 15
-                x_size = 18
+                circle_radius = max(1, int(round(self.prompt_point_size)))
+                x_size = max(1, int(round(self.prompt_point_size * 1.2)))
                 # bright red in BGR for selection highlight
                 gold_bgr = (0, 0, 255)
                 text_bgr = (255, 255, 255)
@@ -2077,6 +2107,7 @@ class C_Elegans_GUI(QMainWindow):
                 prompts,
                 colors=self.colors,
                 model_size=self.model_size,
+                checkpoint_path=getattr(self, 'checkpoint_path', None),
                 start_frame=start_frame,
                 end_frame=end_frame,
                 video_name=video_name,
@@ -2164,8 +2195,8 @@ class C_Elegans_GUI(QMainWindow):
                 # Draw filled circles for positive and X markers for negative prompts
                 # Convert RGB->BGR for OpenCV drawing, then back to RGB
                 img_bgr = cv2.cvtColor(img_rgb, cv2.COLOR_RGB2BGR)
-                circle_radius = 15
-                x_size = 18
+                circle_radius = max(1, int(round(self.prompt_point_size)))
+                x_size = max(1, int(round(self.prompt_point_size * 1.2)))
                 # bright red in BGR for selection highlight
                 gold_bgr = (0, 0, 255)
                 text_bgr = (255, 255, 255)
@@ -2371,8 +2402,11 @@ class C_Elegans_GUI(QMainWindow):
                 gui_instance=self
             )
             
-            # Navigate to this frame and display the new mask
-            self.slider.setValue(frame_idx)
+            # Only reload the display if we're currently viewing this frame.
+            # Avoid slider.setValue which clears the pixmap and shows "Loading..."
+            # for every saved frame regardless of what the user is looking at.
+            if frame_idx == self.current_frame_idx:
+                self._image_loader.request(frame_idx)
         except Exception:
             pass
     
