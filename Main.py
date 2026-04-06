@@ -872,7 +872,6 @@ class ImageLoader(QThread):
                         mask_rgb = cv2.cvtColor(mask_bgr, cv2.COLOR_BGR2RGB)
                         if mask_rgb.shape[:2] != img_rgb.shape[:2]:
                             mask_rgb = cv2.resize(mask_rgb, (img_rgb.shape[1], img_rgb.shape[0]), interpolation=cv2.INTER_NEAREST)
-                        mask_indices = np.any(mask_rgb != [0, 0, 0], axis=-1)
                         # Get opacity from GUI (default 0.5 if not available)
                         opacity = 0.5
                         if hasattr(self, 'gui_instance') and self.gui_instance is not None:
@@ -880,9 +879,13 @@ class ImageLoader(QThread):
                                 opacity = self.gui_instance.mask_opacity
                             except Exception:
                                 pass
-                        # ensure copy before modifying
+                        # Build a soft alpha from the mask by blurring the binary edge,
+                        # which eliminates the hard black fringe at the mask boundary.
+                        binary = (np.any(mask_rgb != [0, 0, 0], axis=-1).astype(np.float32))
+                        alpha = cv2.GaussianBlur(binary, (5, 5), sigmaX=1.5)  # feathered 0..1
+                        alpha = np.clip(alpha * opacity, 0.0, 1.0)[:, :, np.newaxis]  # (H,W,1)
                         img_rgb = img_rgb.copy()
-                        img_rgb[mask_indices] = cv2.addWeighted(img_rgb[mask_indices], 1.0 - opacity, mask_rgb[mask_indices], opacity, 0)
+                        img_rgb = (img_rgb * (1.0 - alpha) + mask_rgb * alpha).astype(np.uint8)
 
                 # emit the composed RGB image (numpy array)
                 self.frameLoaded.emit(idx, img_rgb)
@@ -2390,8 +2393,11 @@ class C_Elegans_GUI(QMainWindow):
             self.tracking_mask_files[frame_idx] = mask_path
             # Clear cached mask for this frame
             self._mask_cache.pop(frame_idx, None)
-            # Clear cached pixmap for this frame so it reloads with mask
-            self.pixmap_cache.pop(frame_idx, None)
+            # Evict the stale pixmap so the next display of this frame reloads with the mask.
+            # Do NOT evict the current frame's pixmap here — let the loader replace it
+            # atomically when ready, so we never flash "Loading..." mid-tracking.
+            if frame_idx != self.current_frame_idx:
+                self.pixmap_cache.pop(frame_idx, None)
             
             # Update image loader references
             self._image_loader.set_references(
@@ -2401,12 +2407,13 @@ class C_Elegans_GUI(QMainWindow):
                 h5_dataset=getattr(self, 'h5_dataset_name', None),
                 gui_instance=self
             )
-            
-            # Only reload the display if we're currently viewing this frame.
-            # Avoid slider.setValue which clears the pixmap and shows "Loading..."
-            # for every saved frame regardless of what the user is looking at.
-            if frame_idx == self.current_frame_idx:
-                self._image_loader.request(frame_idx)
+
+            # Navigate the slider to follow tracking progress
+            self.slider.setValue(frame_idx)
+
+            # Always request a fresh load for this frame (loader will update display
+            # and cache when done, without going through the "Loading..." path)
+            self._image_loader.request(frame_idx)
         except Exception:
             pass
     
@@ -3003,8 +3010,10 @@ class C_Elegans_GUI(QMainWindow):
         self._image_loader.request(self.current_frame_idx)
         self._prefetch_neighbors(self.current_frame_idx)
 
-        # Show a lightweight placeholder while loading
-        self.image_label.setText("Loading...")
+        # Only show placeholder if the label isn't already showing a valid frame.
+        # This prevents "Loading..." flashing when tracking faster than render speed.
+        if self.image_label.pixmap() is None:
+            self.image_label.setText("Loading...")
         # Note: actual composition/blending happens in background loader to minimize UI thread work
 
 
