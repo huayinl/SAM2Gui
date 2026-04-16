@@ -1,0 +1,1 @@
+download the SAM2 model checkpoints from the official repository and place them in this directory.
