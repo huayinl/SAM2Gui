@@ -879,13 +879,9 @@ class ImageLoader(QThread):
                                 opacity = self.gui_instance.mask_opacity
                             except Exception:
                                 pass
-                        # Build a soft alpha from the mask by blurring the binary edge,
-                        # which eliminates the hard black fringe at the mask boundary.
-                        binary = (np.any(mask_rgb != [0, 0, 0], axis=-1).astype(np.float32))
-                        alpha = cv2.GaussianBlur(binary, (5, 5), sigmaX=1.5)  # feathered 0..1
-                        alpha = np.clip(alpha * opacity, 0.0, 1.0)[:, :, np.newaxis]  # (H,W,1)
+                        mask_indices = np.any(mask_rgb != [0, 0, 0], axis=-1)
                         img_rgb = img_rgb.copy()
-                        img_rgb = (img_rgb * (1.0 - alpha) + mask_rgb * alpha).astype(np.uint8)
+                        img_rgb[mask_indices] = cv2.addWeighted(img_rgb[mask_indices], 1.0 - opacity, mask_rgb[mask_indices], opacity, 0)
 
                 # emit the composed RGB image (numpy array)
                 self.frameLoaded.emit(idx, img_rgb)
@@ -3010,10 +3006,8 @@ class C_Elegans_GUI(QMainWindow):
         self._image_loader.request(self.current_frame_idx)
         self._prefetch_neighbors(self.current_frame_idx)
 
-        # Only show placeholder if the label isn't already showing a valid frame.
-        # This prevents "Loading..." flashing when tracking faster than render speed.
-        if self.image_label.pixmap() is None:
-            self.image_label.setText("Loading...")
+        # Show placeholder while waiting for the loader.
+        self.image_label.setText("Loading...")
         # Note: actual composition/blending happens in background loader to minimize UI thread work
 
 
