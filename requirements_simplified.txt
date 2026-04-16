@@ -4,7 +4,7 @@ torchvision
 transformers
 huggingface-hub
 segment-anything
-SAM-2 @ git+https://github.com/facebookresearch/segment-anything-2.git@c2ec8e1
+# SAM-2 @ git+https://github.com/facebookresearch/segment-anything-2.git@c2ec8e1
 
 # Computer Vision & Image Processing
 opencv-python
@@ -25,3 +25,6 @@ omegaconf
 tqdm
 wandb
 pydantic
+
+PyQt5
+h5py
