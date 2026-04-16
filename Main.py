@@ -902,38 +902,29 @@ class TrackerWorker(QThread):
             self.error.emit(str(e))# --- GUI Components ---
 
 class ImageLoader(QThread):
-    """Background loader that reads raw frames and masks from disk/HDF5.
-    Emits (idx, img_rgb, mask_rgb_or_None) so the GUI thread can handle
-    blending at display time — meaning opacity changes never require a disk re-read.
+    """Background loader that reads raw frames (and masks if available) from disk/HDF5.
+    Emits (idx, img_rgb, mask_rgb_or_None) — mask is loaded once here so the GUI
+    thread never hits disk again for opacity/zoom/pan changes.
 
-    Uses a "latest request wins" queue: the loader always processes the most
-    recently requested frame first, discarding stale queued indices.
+    Uses a "latest request wins" queue so the current frame always jumps the queue.
     """
-    # Emits (frame_idx, img_rgb_ndarray, mask_rgb_ndarray_or_None)
     frameLoaded = pyqtSignal(int, object, object)
 
     def __init__(self, parent=None):
         super().__init__(parent)
         self._running = True
 
-        # Priority slot: the single most-important frame to load next
         self._priority_idx = None
-        # Secondary set of prefetch indices (lower priority)
         self._prefetch_set = set()
-        # Lock protecting the above two fields
         import threading
         self._lock = threading.Lock()
         self._event = threading.Event()
 
-        # references (set by GUI) to lists/dicts owned by GUI
         self.image_files = None
         self.mask_files = None
-
-        # optional HDF5 reference
         self.h5_path = None
         self.h5_dataset = None
 
-        # internal HDF5 handle opened in this thread (open once for efficiency)
         self._h5f = None
         self._h5_n_frames = None
 
@@ -942,26 +933,20 @@ class ImageLoader(QThread):
         self.mask_files = mask_files
         self.h5_path = h5_path
         self.h5_dataset = h5_dataset
-        self.gui_instance = gui_instance
-        # reset per-thread HDF5 info; actual file handle will be opened inside run()
         self._h5_n_frames = None
 
     def request(self, idx, priority=True):
-        """Request a frame. priority=True means it jumps the queue."""
         import threading
         with self._lock:
             if priority:
                 self._priority_idx = idx
-                # Remove from prefetch set if it was there
                 self._prefetch_set.discard(idx)
             else:
-                # Only add to prefetch if not already the priority
                 if idx != self._priority_idx:
                     self._prefetch_set.add(idx)
         self._event.set()
 
     def _next_idx(self):
-        """Pop the next index to process (priority first, then prefetch)."""
         import threading
         with self._lock:
             if self._priority_idx is not None:
@@ -973,7 +958,6 @@ class ImageLoader(QThread):
         return None
 
     def _load_raw_image(self, idx):
-        """Load raw img_rgb from HDF5 or file. Returns ndarray or None."""
         if self.h5_path is not None:
             if not H5PY_AVAILABLE:
                 return None
@@ -1013,20 +997,20 @@ class ImageLoader(QThread):
                 return None
             return cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
 
-    def _load_raw_mask(self, idx):
-        """Load raw mask_rgb from disk. Returns ndarray or None."""
+    def _load_mask(self, idx):
+        """Load mask as RGB. Returns None if no mask for this frame."""
         if not self.mask_files or idx not in self.mask_files:
             return None
         mask_bgr = cv2.imread(self.mask_files[idx])
         if mask_bgr is None:
             return None
-        return cv2.cvtColor(mask_bgr, cv2.COLOR_BGR2RGB)
+        mask_rgb = cv2.cvtColor(mask_bgr, cv2.COLOR_BGR2RGB)
+        return mask_rgb
 
     def run(self):
         while self._running:
             self._event.wait(timeout=0.1)
             self._event.clear()
-
             while True:
                 idx = self._next_idx()
                 if idx is None:
@@ -1039,8 +1023,7 @@ class ImageLoader(QThread):
                     img_rgb = self._load_raw_image(idx)
                     if img_rgb is None:
                         continue
-                    mask_rgb = self._load_raw_mask(idx)
-                    # Resize mask to match image if needed
+                    mask_rgb = self._load_mask(idx)
                     if mask_rgb is not None and mask_rgb.shape[:2] != img_rgb.shape[:2]:
                         mask_rgb = cv2.resize(mask_rgb, (img_rgb.shape[1], img_rgb.shape[0]),
                                               interpolation=cv2.INTER_NEAREST)
@@ -1172,21 +1155,22 @@ class C_Elegans_GUI(QMainWindow):
         self.autoseg_frame_idx = None
         self.tracking_results = None # Stores result of SAM 2
         self.colors = np.random.randint(0, 255, (100, 3), dtype=np.uint8) # Pre-generate 100 random colors
-        # Mapping from frame_idx -> mask file path (pre-colored JPGs)
+        # Mapping from frame_idx -> mask file path (pre-colored JPGs) — kept for prompt seeding
         self.tracking_mask_files = {}
         # Mapping from frame_idx -> {obj_id: [(x, y), ...]} centerline points
         self.centerlines = {}
-        # Mask opacity (0.0 to 1.0, where 1.0 = fully opaque)
+        # Mask opacity (0.0 to 1.0)
         self.mask_opacity = 0.5
         # Prompt point size for visualization
         self.prompt_point_size = 5.0
-        # Simple in-memory cache for recently-used color masks to speed up display
-        self._mask_cache = {}
-        self._mask_cache_max = 64
-        # Raw frame cache: stores (img_rgb, mask_rgb_or_None) per frame index
-        # This lets opacity/centerline/prompt changes re-render without disk I/O
+        # Raw frame cache: stores (img_rgb, mask_rgb) — never blended, used as source of truth
         self._raw_frame_cache = OrderedDict()
         self._raw_frame_cache_max = 64
+        # Blended cache: stores pre-blended full-res composite keyed by frame idx.
+        # Invalidated only when opacity changes or a new mask arrives — NOT on zoom/pan.
+        # This makes zoom/pan free: just crop+resize the cached composite.
+        self._blended_cache = OrderedDict()
+        self._blended_cache_max = 64
         # Pixmap cache (scaled QPixmaps) for fast display
         # Use OrderedDict for LRU behavior (most-recently-used at end)
         self.pixmap_cache = OrderedDict()
@@ -1318,11 +1302,14 @@ class C_Elegans_GUI(QMainWindow):
         self.centerlines = {}
 
         # clear caches
-        self._mask_cache = {}
         try:
             self._raw_frame_cache.clear()
         except Exception:
             self._raw_frame_cache = OrderedDict()
+        try:
+            self._blended_cache.clear()
+        except Exception:
+            self._blended_cache = OrderedDict()
         try:
             self.pixmap_cache.clear()
         except Exception:
@@ -2091,35 +2078,27 @@ class C_Elegans_GUI(QMainWindow):
         self.slider.setValue(value)
 
     def _on_mask_opacity_changed(self, value):
-        """Handle mask opacity slider changes — re-blend from cached raw data, no disk I/O."""
+        """Invalidate blended cache and re-blend from raw data with new opacity."""
         self.mask_opacity = value / 100.0
         self.mask_opacity_label.setText(f"{value}%")
-        # Clear only the pixmap cache (scaled composites), not the raw frame cache
+        # Clear blended composites — they were made with the old opacity
+        try:
+            self._blended_cache.clear()
+        except Exception:
+            self._blended_cache = OrderedDict()
         self.clear_pixmap_cache()
-        # Re-render the current frame immediately from cached raw data (no background thread needed)
+        # Re-blend current frame from raw cache
         idx = self.current_frame_idx
         if idx in self._raw_frame_cache:
             img_rgb, mask_rgb = self._raw_frame_cache[idx]
             self._on_frame_loaded(idx, img_rgb, mask_rgb)
         else:
-            # Raw data not cached yet — fall back to a background load
-            try:
-                self._image_loader.request(idx)
-            except Exception:
-                pass
+            self._image_loader.request(idx)
 
     def _on_show_centerlines_changed(self, state):
         """Handle show centerlines checkbox changes."""
         self.clear_pixmap_cache()
-        idx = self.current_frame_idx
-        if idx in self._raw_frame_cache:
-            img_rgb, mask_rgb = self._raw_frame_cache[idx]
-            self._on_frame_loaded(idx, img_rgb, mask_rgb)
-        else:
-            try:
-                self._image_loader.request(idx)
-            except Exception:
-                pass
+        self._render_current_frame_sync()
 
     def _on_centerline_points_changed(self, value):
         """Handle centerline points spinbox changes - resample and redraw."""
@@ -2143,12 +2122,7 @@ class C_Elegans_GUI(QMainWindow):
             
             # Clear cache and reload current frame from raw cache if available
             self.clear_pixmap_cache()
-            idx = self.current_frame_idx
-            if idx in self._raw_frame_cache:
-                img_rgb, mask_rgb = self._raw_frame_cache[idx]
-                self._on_frame_loaded(idx, img_rgb, mask_rgb)
-            else:
-                self._image_loader.request(idx)
+            self._render_current_frame_sync()
         except Exception:
             pass
 
@@ -2157,15 +2131,7 @@ class C_Elegans_GUI(QMainWindow):
         self.prompt_point_size = value / 10.0
         self.prompt_size_value_label.setText(f"{self.prompt_point_size:.1f}")
         self.clear_pixmap_cache()
-        idx = self.current_frame_idx
-        if idx in self._raw_frame_cache:
-            img_rgb, mask_rgb = self._raw_frame_cache[idx]
-            self._on_frame_loaded(idx, img_rgb, mask_rgb)
-        else:
-            try:
-                self._image_loader.request(idx)
-            except Exception:
-                pass
+        self._render_current_frame_sync()
 
     def _resample_centerline(self, centerline, num_points):
         """Resample centerline to desired number of points (same logic as TrackerWorker)."""
@@ -2186,19 +2152,21 @@ class C_Elegans_GUI(QMainWindow):
             self.pixmap_cache = {}
 
     def _render_current_frame_sync(self):
-        """Re-render the current frame immediately on the GUI thread using cached raw data.
-        Used by zoom/pan so we never round-trip through the background loader.
-        Falls back to a loader request if raw data isn't cached yet.
+        """Re-render the current frame on the GUI thread — zero blend work on zoom/pan.
+        Reads the pre-blended composite from _blended_cache if available,
+        otherwise falls back to raw data (re-blends) or the background loader.
         """
         idx = self.current_frame_idx
-        if idx in self._raw_frame_cache:
+        self.pixmap_cache.pop(idx, None)
+        if idx in self._blended_cache:
+            # Fast path: composite already blended, just crop+resize+draw overlays
+            blended = self._blended_cache[idx]
+            mask_rgb = self._raw_frame_cache.get(idx, (None, None))[1] if idx in self._raw_frame_cache else None
+            self._on_frame_loaded(idx, blended, None)  # mask_rgb=None skips re-blend
+        elif idx in self._raw_frame_cache:
             img_rgb, mask_rgb = self._raw_frame_cache[idx]
-            # Evict stale pixmap so _on_frame_loaded will update the display
-            self.pixmap_cache.pop(idx, None)
             self._on_frame_loaded(idx, img_rgb, mask_rgb)
         else:
-            # Raw data not in memory yet — ask the loader (will show Loading... only this once)
-            self.pixmap_cache.pop(idx, None)
             self._image_loader.request(idx)
 
     # ------------------------------------------------------------------
@@ -2590,13 +2558,12 @@ class C_Elegans_GUI(QMainWindow):
         self.use_parent_dir_for_masks = (state == Qt.Checked)
 
     def _on_frame_loaded(self, idx, img_rgb, mask_rgb=None):
-        # Called in GUI thread when image loader has raw RGB numpy images ready.
-        # mask_rgb is None if no mask exists for this frame.
+        # Called in GUI thread. Stores raw data, blends once into _blended_cache,
+        # then renders. Zoom/pan re-renders read from _blended_cache — no blend work.
         try:
             img_rgb = np.ascontiguousarray(img_rgb)
 
-            # Cache the raw (unblended) data so opacity/centerline changes
-            # can re-render instantly without going back to disk.
+            # Store raw (img, mask) — source of truth for opacity changes
             try:
                 if len(self._raw_frame_cache) >= self._raw_frame_cache_max:
                     self._raw_frame_cache.popitem(last=False)
@@ -2604,6 +2571,30 @@ class C_Elegans_GUI(QMainWindow):
                 self._raw_frame_cache.move_to_end(idx, last=True)
             except Exception:
                 self._raw_frame_cache[idx] = (img_rgb, mask_rgb)
+
+            # Blend once and cache the result — zoom/pan will reuse this directly
+            if mask_rgb is not None:
+                opacity = getattr(self, 'mask_opacity', 0.5)
+                mask_indices = np.any(mask_rgb != [0, 0, 0], axis=-1)
+                blended = img_rgb.copy()
+                blended[mask_indices] = (
+                    img_rgb[mask_indices] * (1.0 - opacity) +
+                    mask_rgb[mask_indices] * opacity
+                ).astype(np.uint8)
+                blended = np.ascontiguousarray(blended)
+            else:
+                blended = img_rgb  # no copy needed — read-only from here
+
+            try:
+                if len(self._blended_cache) >= self._blended_cache_max:
+                    self._blended_cache.popitem(last=False)
+                self._blended_cache[idx] = blended
+                self._blended_cache.move_to_end(idx, last=True)
+            except Exception:
+                self._blended_cache[idx] = blended
+
+            # Use the blended composite for all rendering below
+            img_rgb = blended
 
             # keep a copy of the full-resolution RGB for coordinate mapping
             if idx == self.current_frame_idx:
@@ -2614,16 +2605,6 @@ class C_Elegans_GUI(QMainWindow):
 
             if self._last_loaded_rgb is None and idx == self.current_frame_idx:
                 return
-
-            # --- Blend mask on the GUI thread (cheap, no disk I/O) ---
-            if mask_rgb is not None:
-                opacity = self.mask_opacity
-                mask_indices = np.any(mask_rgb != [0, 0, 0], axis=-1)
-                img_rgb = img_rgb.copy()
-                img_rgb[mask_indices] = cv2.addWeighted(
-                    img_rgb[mask_indices], 1.0 - opacity,
-                    mask_rgb[mask_indices], opacity, 0)
-                img_rgb = np.ascontiguousarray(img_rgb)
 
             orig_h, orig_w = img_rgb.shape[0], img_rgb.shape[1]
 
@@ -2975,52 +2956,23 @@ class C_Elegans_GUI(QMainWindow):
             super().keyPressEvent(event)
 
     def _on_mask_saved(self, frame_idx, mask_path):
-        """Called when a single mask is saved during tracking.
-        Update mask index and display if on that frame.
-        """
+        """Called when a single mask is saved during tracking. Update mask index."""
         try:
-            # Add to mask index
             self.tracking_mask_files[frame_idx] = mask_path
-            # Clear cached mask and raw frame data for this frame (mask is now available)
-            self._mask_cache.pop(frame_idx, None)
+            # Invalidate blended composite so next render picks up the new mask
+            self._blended_cache.pop(frame_idx, None)
             self._raw_frame_cache.pop(frame_idx, None)
-            # Evict the stale pixmap so the next display of this frame reloads with the mask.
-            # Do NOT evict the current frame's pixmap here — let the loader replace it
-            # atomically when ready, so we never flash "Loading..." mid-tracking.
-            if frame_idx != self.current_frame_idx:
-                self.pixmap_cache.pop(frame_idx, None)
-            
-            # Update image loader references
-            self._image_loader.set_references(
-                image_files=self.image_files, 
-                mask_files=self.tracking_mask_files, 
-                h5_path=getattr(self, 'h5_file_path', None), 
-                h5_dataset=getattr(self, 'h5_dataset_name', None),
-                gui_instance=self
-            )
-
-            # Navigate the slider to follow tracking progress
             self.slider.setValue(frame_idx)
-
-            # Always request a fresh load for this frame (loader will update display
-            # and cache when done, without going through the "Loading..." path)
-            self._image_loader.request(frame_idx)
         except Exception:
             pass
     
     def _on_centerline_computed(self, frame_idx, centerline_dict):
-        """Called when centerlines are computed for a frame.
-        Store centerlines and trigger redraw if viewing this frame.
-        """
+        """Called when centerlines are computed for a frame."""
         try:
-            # Store centerlines for this frame
             self.centerlines[frame_idx] = centerline_dict
-            # Clear cached pixmap and raw frame so centerlines get drawn on next load
             self.pixmap_cache.pop(frame_idx, None)
-            self._raw_frame_cache.pop(frame_idx, None)
-            # If viewing this frame, request reload to draw centerlines
             if frame_idx == self.current_frame_idx:
-                self._image_loader.request(frame_idx)
+                self._render_current_frame_sync()
         except Exception:
             pass
 
@@ -3042,17 +2994,12 @@ class C_Elegans_GUI(QMainWindow):
                         continue
                     new_masks[idx] = os.path.join(mask_folder, fname)
 
-        # Drop any cached masks for frames that were just regenerated, then merge.
-        for idx in new_masks.keys():
-            try:
-                self._mask_cache.pop(idx, None)
-            except Exception:
-                pass
+        # Merge new masks into tracking_mask_files (used for prompt seeding)
         self.tracking_mask_files.update(new_masks)
 
-        # update image loader references to include mask files
+        # update image loader references
         try:
-            self._image_loader.set_references(image_files=self.image_files, mask_files=self.tracking_mask_files, h5_path=getattr(self, 'h5_file_path', None), h5_dataset=getattr(self, 'h5_dataset_name', None), gui_instance=self)
+            self._image_loader.set_references(image_files=self.image_files, mask_files=self.tracking_mask_files, h5_path=getattr(self, 'h5_file_path', None), h5_dataset=getattr(self, 'h5_dataset_name', None))
         except Exception:
             pass
 
@@ -3065,19 +3012,6 @@ class C_Elegans_GUI(QMainWindow):
             self.btn_stop.setEnabled(False)
         except Exception:
             pass
-        # Clear any cached scaled pixmaps (they were created without masks)
-        try:
-            self.pixmap_cache.clear()
-        except Exception:
-            self.pixmap_cache = {}
-
-        # Prefetch current frame (so the masked version loads) and update display
-        try:
-            self._image_loader.request(self.current_frame_idx)
-            self._prefetch_neighbors(self.current_frame_idx)
-        except Exception:
-            pass
-
         self.update_display()
 
     def eventFilter(self, obj, event):
@@ -3126,60 +3060,30 @@ class C_Elegans_GUI(QMainWindow):
                     # reset hover
                     self._hovered_point = None
                     pixmap = self.image_label.pixmap()
-                    # get prompts for current frame
                     prompts = self.get_prompts_for_frame(self.current_frame_idx)
                     if pixmap is None or not any(prompts):
                         self.image_label.setCursor(Qt.ArrowCursor)
                         return False
 
+                    if self._last_loaded_rgb is None:
+                        self.image_label.setCursor(Qt.ArrowCursor)
+                        return False
+
+                    orig_h, orig_w = self._last_loaded_rgb.shape[:2]
                     label_w = self.image_label.width()
                     label_h = self.image_label.height()
-                    pixmap_w = pixmap.width()
-                    pixmap_h = pixmap.height()
-                    offset_x = max(0, (label_w - pixmap_w) // 2)
-                    offset_y = max(0, (label_h - pixmap_h) // 2)
-
+                    zoom_level = getattr(self, 'zoom_level', 1.0)
+                    pan_offset = getattr(self, 'pan_offset', (0.0, 0.0))
                     pos = event.pos()
-                    x_in = pos.x() - offset_x
-                    y_in = pos.y() - offset_y
-                    if x_in < 0 or y_in < 0 or x_in >= pixmap_w or y_in >= pixmap_h:
-                        self.image_label.setCursor(Qt.ArrowCursor)
-                        return False
-
-                    # get original image size
-                    try:
-                        if self._last_loaded_rgb is not None:
-                            orig_h, orig_w = self._last_loaded_rgb.shape[:2]
-                        elif getattr(self, 'h5_file_path', None) is not None and H5PY_AVAILABLE:
-                            try:
-                                with h5py.File(self.h5_file_path, 'r') as f:
-                                    ds = self.h5_dataset_name if getattr(self, 'h5_dataset_name', None) is not None else next(iter(f.keys()))
-                                    arr = f[ds][self.current_frame_idx]
-                                    tmp = np.asarray(arr)
-                                    orig_h, orig_w = tmp.shape[:2]
-                            except Exception:
-                                self.image_label.setCursor(Qt.ArrowCursor)
-                                return False
-                        else:
-                            orig = cv2.imread(self.image_files[self.current_frame_idx])
-                            orig_h, orig_w = orig.shape[:2]
-                    except Exception:
-                        self.image_label.setCursor(Qt.ArrowCursor)
-                        return False
-
-                    # compute scale from original->pixmap (preserve aspect ratio so scales equal)
-                    scale_x = pixmap_w / float(orig_w)
-                    scale_y = pixmap_h / float(orig_h)
-                    scale = min(scale_x, scale_y)
-
-                    # threshold in display pixels for selecting a point
                     thr = 12
                     found = False
-                    # iterate over all points to find nearest
                     for obj_idx, pts in enumerate(prompts):
                         for pt_idx, ((cx, cy), label) in enumerate(pts):
-                            disp_x = int(cx * scale) + offset_x
-                            disp_y = int(cy * scale) + offset_y
+                            try:
+                                disp_x, disp_y = CoordinateMapper.image_to_display(
+                                    cx, cy, label_w, label_h, orig_w, orig_h, zoom_level, pan_offset)
+                            except Exception:
+                                continue
                             dx = disp_x - pos.x()
                             dy = disp_y - pos.y()
                             if dx*dx + dy*dy <= thr*thr:
@@ -3270,14 +3174,12 @@ class C_Elegans_GUI(QMainWindow):
                         except Exception:
                             pass
 
-                        # refresh UI (invalidate cache and request recomposition)
+                        # refresh UI
                         try:
                             self.update_object_sidebar()
-                            if self.current_frame_idx in self.pixmap_cache:
-                                self.pixmap_cache.pop(self.current_frame_idx, None)
-                            self._image_loader.request(self.current_frame_idx)
+                            self.pixmap_cache.pop(self.current_frame_idx, None)
+                            self._render_current_frame_sync()
                             self._prefetch_neighbors(self.current_frame_idx)
-                            self.update_display()
                             self.status_label.setText("Deleted prompt point")
                         except Exception:
                             pass
