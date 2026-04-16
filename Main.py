@@ -1060,7 +1060,7 @@ class CoordinateMapper:
         """Convert a display-pixel position to original-image coordinates."""
         pixmap_w, pixmap_h = CoordinateMapper._pixmap_size(label_w, label_h, orig_w, orig_h, zoom_level)
 
-        # Remove label-centering offset (letterbox bars)
+        # Remove label-centering offset (letterbox bars at zoom=1)
         offset_x = (label_w - pixmap_w) / 2
         offset_y = (label_h - pixmap_h) / 2
         x_in_pixmap = display_x - offset_x
@@ -1070,9 +1070,11 @@ class CoordinateMapper:
         frac_x = x_in_pixmap / pixmap_w
         frac_y = y_in_pixmap / pixmap_h
 
-        # Map into original-image space via the viewport
-        viewport_w = orig_w / zoom_level
-        viewport_h = orig_h / zoom_level
+        # Viewport size in image-space — must use label aspect ratio, not image aspect ratio
+        base_scale = min(label_w / orig_w, label_h / orig_h)
+        viewport_w = label_w / (base_scale * zoom_level)
+        viewport_h = label_h / (base_scale * zoom_level)
+
         img_x = pan_offset[0] + frac_x * viewport_w
         img_y = pan_offset[1] + frac_y * viewport_h
 
@@ -1092,8 +1094,9 @@ class CoordinateMapper:
         offset_x = (label_w - pixmap_w) / 2
         offset_y = (label_h - pixmap_h) / 2
 
-        viewport_w = orig_w / zoom_level
-        viewport_h = orig_h / zoom_level
+        base_scale = min(label_w / orig_w, label_h / orig_h)
+        viewport_w = label_w / (base_scale * zoom_level)
+        viewport_h = label_h / (base_scale * zoom_level)
 
         frac_x = (img_x - pan_offset[0]) / viewport_w
         frac_y = (img_y - pan_offset[1]) / viewport_h
@@ -1110,11 +1113,17 @@ class CoordinateMapper:
         zoom_level: float,
         pan_offset: tuple,
     ) -> tuple:
-        """Return (x0, y0, x1, y1) crop rectangle in original-image pixels, clamped to image bounds."""
-        viewport_w = orig_w / zoom_level
-        viewport_h = orig_h / zoom_level
+        """Return (x0, y0, x1, y1) crop rectangle in original-image pixels, clamped to image bounds.
 
-        # Clamp pan_offset so the viewport stays within image bounds
+        The viewport size is derived from the label's aspect ratio so the crop
+        matches exactly what gets stretched into the label — no distortion.
+        """
+        # The base scale is the same fit-to-window scale used at zoom=1
+        base_scale = min(label_w / orig_w, label_h / orig_h)
+        # At zoom_level Z the visible region in image-space is:
+        viewport_w = label_w / (base_scale * zoom_level)
+        viewport_h = label_h / (base_scale * zoom_level)
+
         x0 = max(0.0, min(pan_offset[0], orig_w - viewport_w))
         y0 = max(0.0, min(pan_offset[1], orig_h - viewport_h))
         x1 = x0 + viewport_w
@@ -1715,24 +1724,6 @@ class C_Elegans_GUI(QMainWindow):
         end_row_layout.addStretch()
         self.left_layout.addWidget(end_row_widget)
 
-        # Stream mode row
-        stream_row_widget = QWidget()
-        stream_row_layout = QHBoxLayout()
-        stream_row_layout.setContentsMargins(0, 0, 0, 0)
-        stream_row_widget.setLayout(stream_row_layout)
-        self.stream_mode_checkbox = QCheckBox("Stream Mode")
-        self.stream_mode_checkbox.setChecked(False)
-        stream_row_layout.addWidget(self.stream_mode_checkbox)
-        stream_row_layout.addWidget(QLabel("Threshold:"))
-        self.stream_threshold_spin = QSpinBox()
-        self.stream_threshold_spin.setMinimum(1)
-        self.stream_threshold_spin.setMaximum(1000)
-        self.stream_threshold_spin.setValue(10)
-        self.stream_threshold_spin.setFixedWidth(60)
-        stream_row_layout.addWidget(self.stream_threshold_spin)
-        stream_row_layout.addStretch()
-        self.left_layout.addWidget(stream_row_widget)
-
         # Show centerlines checkbox
         centerline_checkbox_widget = QWidget()
         centerline_checkbox_layout = QHBoxLayout()
@@ -2175,8 +2166,13 @@ class C_Elegans_GUI(QMainWindow):
 
     def _clamp_pan_offset(self, orig_w: int, orig_h: int) -> None:
         """Clamp pan_offset so the viewport stays within image bounds."""
-        viewport_w = orig_w / self.zoom_level
-        viewport_h = orig_h / self.zoom_level
+        label_w = self.image_label.width()
+        label_h = self.image_label.height()
+        if label_w <= 0 or label_h <= 0:
+            return
+        base_scale = min(label_w / orig_w, label_h / orig_h)
+        viewport_w = label_w / (base_scale * self.zoom_level)
+        viewport_h = label_h / (base_scale * self.zoom_level)
         x0 = max(0.0, min(self.pan_offset[0], orig_w - viewport_w))
         y0 = max(0.0, min(self.pan_offset[1], orig_h - viewport_h))
         self.pan_offset = (x0, y0)
@@ -2638,14 +2634,13 @@ class C_Elegans_GUI(QMainWindow):
                             full_skeleton = centerline_data if centerline_data else []
                             resampled_points = centerline_data if centerline_data else []
                         # Batch-transform all skeleton points at once
+                        base_scale = min(label_w / orig_w, label_h / orig_h)
+                        disp_scale = base_scale * zoom_level
                         if full_skeleton:
                             try:
                                 pts = np.array(full_skeleton, dtype=np.float32)
-                                # image_to_display vectorized
-                                scale_x = label_w * zoom_level / orig_w
-                                scale_y = label_h * zoom_level / orig_h
-                                dxs = (pts[:, 0] - pan_offset[0]) * scale_x
-                                dys = (pts[:, 1] - pan_offset[1]) * scale_y
+                                dxs = (pts[:, 0] - pan_offset[0]) * disp_scale
+                                dys = (pts[:, 1] - pan_offset[1]) * disp_scale
                                 visible = (dxs >= 0) & (dxs < label_w) & (dys >= 0) & (dys < label_h)
                                 vis_pts = np.stack([dxs[visible], dys[visible]], axis=1).astype(np.int32)
                                 if len(vis_pts) >= 2:
@@ -2657,10 +2652,8 @@ class C_Elegans_GUI(QMainWindow):
                         if resampled_points:
                             try:
                                 pts = np.array(resampled_points, dtype=np.float32)
-                                scale_x = label_w * zoom_level / orig_w
-                                scale_y = label_h * zoom_level / orig_h
-                                dxs = (pts[:, 0] - pan_offset[0]) * scale_x
-                                dys = (pts[:, 1] - pan_offset[1]) * scale_y
+                                dxs = (pts[:, 0] - pan_offset[0]) * disp_scale
+                                dys = (pts[:, 1] - pan_offset[1]) * disp_scale
                                 visible = (dxs >= 0) & (dxs < label_w) & (dys >= 0) & (dys < label_h)
                                 for px, py in zip(dxs[visible].astype(int), dys[visible].astype(int)):
                                     cv2.circle(display_bgr, (px, py), 3, red_bgr, -1)
@@ -3046,8 +3039,9 @@ class C_Elegans_GUI(QMainWindow):
                             orig_h, orig_w = self._last_loaded_rgb.shape[:2]
                             label_w = self.image_label.width()
                             label_h = self.image_label.height()
-                            viewport_w = orig_w / self.zoom_level
-                            viewport_h = orig_h / self.zoom_level
+                            base_scale = min(label_w / orig_w, label_h / orig_h)
+                            viewport_w = label_w / (base_scale * self.zoom_level)
+                            viewport_h = label_h / (base_scale * self.zoom_level)
                             new_pan_x = self.pan_offset[0] - dx * viewport_w / label_w
                             new_pan_y = self.pan_offset[1] - dy * viewport_h / label_h
                             self.pan_offset = (new_pan_x, new_pan_y)
