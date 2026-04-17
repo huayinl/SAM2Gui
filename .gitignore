@@ -6,7 +6,9 @@ small_thumbnails
 sam2_configs
 checkpoints/*.pt
 .DS_Store
+merge
 __pycache__
+segment_anything_2
 segment_anything_2/
 *.png
 *.jpg
