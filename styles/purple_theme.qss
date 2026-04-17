@@ -59,17 +59,6 @@ QWidget#OpacityCard {
     border-radius: 12px;
 }
 
-QWidget#LeftSidebarCard > QWidget,
-QWidget#RightSidebarCard > QWidget,
-QWidget#OpacityCard > QWidget,
-QWidget#SelectionCard > QWidget {
-    background-color: transparent;
-}
-
-QScrollArea#RightSidebarCard QWidget {
-    background-color: transparent;
-}
-
 QLabel#VideoCanvas {
     background-color: #f9fafb;
     border: 1px solid #d1d5db;

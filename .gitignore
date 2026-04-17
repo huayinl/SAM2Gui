@@ -9,3 +9,7 @@ checkpoints/*.pt
 merge
 __pycache__
 segment_anything_2
+segment_anything_2/
+*.png
+*.jpg
+*.txt

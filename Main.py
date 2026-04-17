@@ -17,56 +17,114 @@ except Exception:
     H5PY_AVAILABLE = False
 from PyQt5.QtWidgets import (QApplication, QMainWindow, QWidget, QVBoxLayout, 
                              QHBoxLayout, QPushButton, QLabel, QFileDialog, 
-                             QStackedWidget, QSlider, QMessageBox, QProgressBar, QComboBox, QScrollArea, QSpinBox, QCheckBox, QAction, QSplitter)
+                             QStackedWidget, QSlider, QMessageBox, QProgressBar, QComboBox, QScrollArea, QSpinBox, QCheckBox, QAction, QSplitter,
+                             QDialog, QLineEdit, QFormLayout, QDialogButtonBox)
 from PyQt5.QtCore import Qt, QThread, pyqtSignal, QTimer, QEvent
 from PyQt5.QtGui import QImage, QPixmap, QPainter, QColor, QPen, QFont
 from queue import Queue, Empty
 from collections import OrderedDict
+from config import *
+import matplotlib.pyplot as plt
 
 # --- Check for SAM 2 ---
 try:
-    from sam2.build_sam import build_sam2_video_predictor
+    from segment_anything_2.sam2.build_sam import build_sam2_video_predictor
     SAM2_AVAILABLE = True
 except ImportError:
     SAM2_AVAILABLE = False
     print("Warning: SAM 2 library not found. Tracking will not function.")
 
-# --- Logic from your script (Refactored) ---
-
 def process_image_and_scale_centers(img, downsample_resolution=8, min_area=1000, max_area=50000, min_hole_area=100000, num_skeleton_points=10):
-    # [Exactly as provided in your prompt]
+    """
+    Process the image to create a mask and extract scaled centerline points for SAM 2 prompts.
+
+    Args:
+        img: Input image (numpy array)
+        downsample_resolution: Factor to downsample the image for processing
+        min_area: Minimum area of blobs to keep
+        max_area: Maximum area of blobs to keep
+        min_hole_area: Minimum area of holes to fill in the mask
+        num_skeleton_points: Number of points to sample from the skeleton for prompts
+        LOGGING: Whether to log processing information
+    """
+
+    # Assumption:
+    # input img is a single frame (H, W, C) or (H, W) numpy array
+    # there's a slide with dark worms on a lighter background, 
+    # and an irregular black border around the image that we want to exclude from the mask
+
+    # (1) downsample the image for faster processing
     original_height, original_width = img.shape[:2]
     new_width = original_width // downsample_resolution
     new_height = original_height // downsample_resolution
     
     downsampled_img = cv2.resize(img, (new_width, new_height))
+    if LOGGING:
+        print(f"Original image size: {original_width}x{original_height}")
+        print(f"Downsampled image size: {new_width}x{new_height}")
+        plt.imshow(downsampled_img)
+        plt.title("Downsampled Image")
+        plt.axis('off')
+        plt.show()
+        plt.savefig("debug_downsampled_image.png")
     
     if len(downsampled_img.shape) == 3:
         gray_img = cv2.cvtColor(downsampled_img, cv2.COLOR_BGR2GRAY)
     else:
         gray_img = downsampled_img
+    
+    if LOGGING:
+        plt.imshow(gray_img, cmap='gray')
+        plt.title("Grayscale Image")
+        plt.axis('off')
+        plt.show()
+        plt.savefig("debug_grayscale_image.png")
 
+    # (2) create initial mask using Otsu's thresholding
+    # (worms are black , background is white, and border is also black)
     blurred = cv2.GaussianBlur(gray_img, (5, 5), 0)
     _, initial_mask = cv2.threshold(blurred, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
 
+    if LOGGING:
+        plt.imshow(initial_mask, cmap='gray')
+        plt.title("Initial Mask after Otsu's Thresholding")
+        plt.axis('off')
+        plt.show()
+        plt.savefig("debug_initial_mask.png")
+
+    # (3) use connected components to filter out the dark border and small worm blobs (cut up worms or noise
     inv_mask = 255 - initial_mask
     num_labels, labels, stats, centroids = cv2.connectedComponentsWithStats(inv_mask, connectivity=8)
     filtered_mask = initial_mask.copy()
-    
     for i in range(1, num_labels):
         area = stats[i, cv2.CC_STAT_AREA]
         if area < min_area:
+            # filter out cut up worms and noise
             filtered_mask[labels == i] = 255
         elif area > max_area:
+            # filter out the dark border
             filtered_mask[labels == i] = 255
+    if LOGGING:
+        plt.imshow(filtered_mask, cmap='gray')
+        plt.title("Filtered Mask after Area Thresholding")
+        plt.axis('off')
+        plt.show()
+        plt.savefig("debug_filtered_mask.png")
 
+    # (4) fill holes in the worms (so solid masks for skeletonization)
     filled_mask = filtered_mask.copy()
     num_labels_white, labels_white, stats_white, centroids_white = cv2.connectedComponentsWithStats(filled_mask, connectivity=8)
-    
     for i in range(1, num_labels_white):
         if stats_white[i, cv2.CC_STAT_AREA] < min_hole_area:
             filled_mask[labels_white == i] = 0
+    if LOGGING:
+        plt.imshow(filled_mask, cmap='gray')
+        plt.title("Filled Mask after Hole Filling")
+        plt.axis('off')
+        plt.show()
+        plt.savefig("debug_filled_mask.png")
 
+    # (5) extract skeleton points from the mask for SAM 2 prompts
     mask = filled_mask
     num_labels_blobs, labels_blobs, stats_blobs, centroids_blobs = cv2.connectedComponentsWithStats(255 - mask, connectivity=8)
     blob_centers = []
@@ -88,11 +146,189 @@ def process_image_and_scale_centers(img, downsample_resolution=8, min_area=1000,
                     blob_skeleton_points = [all_points[j] for j in indices]
                 blob_centers.append(blob_skeleton_points)
 
+    if LOGGING:
+        print(f"Found {len(blob_centers)} blobs with area >= {min_area}")
+        plt.imshow(gray_img, cmap='gray')
+        for i, blob_points in enumerate(blob_centers):
+            print(f"Blob {i+1}: {len(blob_points)} skeleton points")
+            plt.scatter([p[0] for p in blob_points], [p[1] for p in blob_points], label=f'Blob {i+1}')
+        plt.title("Extracted Skeleton Points from Blobs")
+        plt.legend()
+        plt.axis('equal')
+        plt.gca().invert_yaxis()
+        plt.show()
+        plt.savefig("debug_blob_skeleton_points.png")
+    
+    # (6) scale the skeleton points back up to the original image resolution for SAM 2 prompts
     scaled_blob_centers = []
     for blob_points in blob_centers:
         scaled_points = [(int(cx * downsample_resolution), int(cy * downsample_resolution)) for cx, cy in blob_points]
         scaled_blob_centers.append(scaled_points)
+    if LOGGING:
+        plt.imshow(img, cmap='gray')
+        for i, blob_points in enumerate(scaled_blob_centers):
+            print(f"Blob {i+1}: {len(blob_points)} scaled skeleton points")
+            plt.scatter([p[0] for p in blob_points], [p[1] for p in blob_points], label=f'Blob {i+1}')
+        plt.title("Skeleton Points for SAM 2 Prompts (Scaled back to original img dimensions)")
+        plt.legend()
+        plt.axis('equal')
+        plt.gca().invert_yaxis()
+        plt.show()
+        plt.savefig("debug_scaled_blob_skeleton_points.png")
     return scaled_blob_centers
+
+# --- Worker Thread for TIF → HDF5 Conversion ---
+class TifToH5Worker(QThread):
+    progress = pyqtSignal(int)   # 0-100
+    finished = pyqtSignal(str)   # output path on success
+    error = pyqtSignal(str)
+
+    def __init__(self, tif_dir, output_path):
+        super().__init__()
+        self.tif_dir = tif_dir
+        self.output_path = output_path
+
+    def run(self):
+        try:
+            import tifffile
+            from pathlib import Path
+            tif_files = sorted(
+                Path(self.tif_dir).glob("*.tif"),
+                key=lambda p: p.name
+            )
+            tif_files += sorted(
+                Path(self.tif_dir).glob("*.tiff"),
+                key=lambda p: p.name
+            )
+            if not tif_files:
+                self.error.emit("No .tif / .tiff files found in the selected folder.")
+                return
+            total = len(tif_files)
+            with h5py.File(self.output_path, "w") as f:
+                first = tifffile.imread(str(tif_files[0]))
+                ds = f.create_dataset(
+                    "frames",
+                    shape=(total, *first.shape),
+                    dtype=first.dtype,
+                    compression="gzip",
+                    compression_opts=4,
+                )
+                ds[0] = first
+                self.progress.emit(int(1 / total * 100))
+                for i, fp in enumerate(tif_files[1:], start=1):
+                    ds[i] = tifffile.imread(str(fp))
+                    self.progress.emit(int((i + 1) / total * 100))
+                f.attrs["source"] = str(self.tif_dir)
+                f.attrs["frame_count"] = total
+            self.finished.emit(self.output_path)
+        except Exception as e:
+            self.error.emit(str(e))
+
+
+class TifToH5Dialog(QDialog):
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.setWindowTitle("Convert TIF Folder to HDF5")
+        self.setMinimumWidth(480)
+        self._worker = None
+        self._build_ui()
+
+    def _build_ui(self):
+        layout = QVBoxLayout(self)
+        form = QFormLayout()
+
+        # TIF folder row
+        tif_row = QHBoxLayout()
+        self._tif_edit = QLineEdit()
+        self._tif_edit.setPlaceholderText("Select folder containing .tif frames…")
+        self._tif_edit.setReadOnly(True)
+        btn_tif = QPushButton("Browse…")
+        btn_tif.clicked.connect(self._browse_tif)
+        tif_row.addWidget(self._tif_edit)
+        tif_row.addWidget(btn_tif)
+        form.addRow("TIF Folder:", tif_row)
+
+        # Output HDF5 row
+        out_row = QHBoxLayout()
+        self._out_edit = QLineEdit()
+        self._out_edit.setPlaceholderText("Choose output .h5 file path…")
+        self._out_edit.setReadOnly(True)
+        btn_out = QPushButton("Browse…")
+        btn_out.clicked.connect(self._browse_output)
+        out_row.addWidget(self._out_edit)
+        out_row.addWidget(btn_out)
+        form.addRow("Output HDF5:", out_row)
+
+        layout.addLayout(form)
+
+        # Progress bar (hidden until conversion starts)
+        self._progress = QProgressBar()
+        self._progress.setRange(0, 100)
+        self._progress.setValue(0)
+        self._progress.setVisible(False)
+        layout.addWidget(self._progress)
+
+        self._status_label = QLabel("")
+        self._status_label.setAlignment(Qt.AlignCenter)
+        self._status_label.setVisible(False)
+        layout.addWidget(self._status_label)
+
+        # Buttons
+        self._btn_box = QDialogButtonBox()
+        self._convert_btn = self._btn_box.addButton("Convert", QDialogButtonBox.AcceptRole)
+        self._btn_box.addButton(QDialogButtonBox.Cancel)
+        self._convert_btn.clicked.connect(self._start_conversion)
+        self._btn_box.rejected.connect(self._on_cancel)
+        layout.addWidget(self._btn_box)
+
+    def _browse_tif(self):
+        folder = QFileDialog.getExistingDirectory(self, "Select TIF Folder")
+        if folder:
+            self._tif_edit.setText(folder)
+
+    def _browse_output(self):
+        path, _ = QFileDialog.getSaveFileName(self, "Save HDF5 As", "", "HDF5 Files (*.h5 *.hdf5)")
+        if path:
+            if not (path.endswith(".h5") or path.endswith(".hdf5")):
+                path += ".h5"
+            self._out_edit.setText(path)
+
+    def _start_conversion(self):
+        tif_dir = self._tif_edit.text().strip()
+        out_path = self._out_edit.text().strip()
+        if not tif_dir or not out_path:
+            QMessageBox.warning(self, "Missing Input", "Please select both a TIF folder and an output path.")
+            return
+
+        self._convert_btn.setEnabled(False)
+        self._progress.setVisible(True)
+        self._progress.setValue(0)
+        self._status_label.setText("Converting…")
+        self._status_label.setVisible(True)
+
+        self._worker = TifToH5Worker(tif_dir, out_path)
+        self._worker.progress.connect(self._progress.setValue)
+        self._worker.finished.connect(self._on_finished)
+        self._worker.error.connect(self._on_error)
+        self._worker.start()
+
+    def _on_finished(self, out_path):
+        self._progress.setValue(100)
+        self._status_label.setText(f"Done! Saved to: {out_path}")
+        self._convert_btn.setEnabled(True)
+        QMessageBox.information(self, "Conversion Complete", f"HDF5 file saved to:\n{out_path}")
+        self.accept()
+
+    def _on_error(self, msg):
+        self._status_label.setText(f"Error: {msg}")
+        self._convert_btn.setEnabled(True)
+        QMessageBox.critical(self, "Conversion Failed", msg)
+
+    def _on_cancel(self):
+        if self._worker and self._worker.isRunning():
+            self._worker.terminate()
+        self.reject()
+
 
 # --- Worker Thread for Heavy SAM 2 Processing ---
 class TrackerWorker(QThread):
@@ -102,17 +338,20 @@ class TrackerWorker(QThread):
     maskSaved = pyqtSignal(int, str) # Emits (frame_idx, mask_file_path) when mask is saved
     centerlineComputed = pyqtSignal(int, dict) # Emits (frame_idx, {obj_id: centerline_points})
 
-    def __init__(self, video_path, device, scaled_blob_centers, colors=None, model_size='base', start_frame=0, end_frame=None, video_name=None, num_centerline_points=100, save_mask_dir=None):
+    def __init__(self, video_source, device, scaled_blob_centers, colors=None, model_size=DEFAULT_MODEL_SIZE, checkpoint_path=None, start_frame=0, end_frame=None, video_name=None, num_centerline_points=100, save_mask_dir="./masks", batch_size=BATCH_SIZE,
+                 kernel_size=None, kernel_iterations=None, num_positive_prompts=None, negative_kernel_size=None, negative_kernel_iterations=None, num_negative_prompts=None):
         super().__init__()
-        self.save_mask_dir = save_mask_dir or "/Users/huayinluo/Documents/code/zhenlab/MultiscaleSEM/masks"
-        self.video_path = video_path
+        self.video_source = video_source  # Can be HDF5 file or directory of images
+        self.save_mask_dir = save_mask_dir
         self.device = device
         self.scaled_blob_centers = scaled_blob_centers
         self.model_size = model_size
+        self.checkpoint_path = checkpoint_path
         self.start_frame = int(start_frame) if start_frame is not None else 0
         self.end_frame = int(end_frame) if end_frame is not None else None
         self.video_name = video_name  # Store video_name (h5_file_path or video folder name)
         self.num_centerline_points = int(num_centerline_points) if num_centerline_points is not None else 100
+        self.batch_size = int(batch_size) if batch_size is not None else BATCH_SIZE
         self._stop_requested = False
         # Colors can be passed in; if not, fall back to random colors
         if colors is None:
@@ -120,6 +359,71 @@ class TrackerWorker(QThread):
         else:
             self.colors = colors # We need colors here now to bake them into the images
 
+        # Tracking parameter overrides (fall back to config if None)
+        self.kernel_size = kernel_size if kernel_size is not None else KERNEL_SIZE
+        self.kernel_iterations = kernel_iterations if kernel_iterations is not None else KERNEL_ITERATIONS
+        self.num_positive_prompts = num_positive_prompts if num_positive_prompts is not None else NUM_POSITIVE_PROMPTS
+        self.negative_kernel_size = negative_kernel_size if negative_kernel_size is not None else NEGATIVE_KERNEL_SIZE
+        self.negative_kernel_iterations = negative_kernel_iterations if negative_kernel_iterations is not None else NEGATIVE_KERNEL_ITERATIONS
+        self.num_negative_prompts = num_negative_prompts if num_negative_prompts is not None else NUM_NEGATIVE_PROMPTS
+        print(f"Initialized TrackerWorker with start_frame={self.start_frame}, end_frame={self.end_frame}, batch_size={self.batch_size}")
+
+    def create_temp_video_dir_from_h5(self, start_frame, end_frame, dataset_name=None):
+        print(f"Creating temporary video directory from HDF5 frames {start_frame} to {end_frame}...")
+        with h5py.File(self.video_source, 'r') as f:
+            ds_name = dataset_name
+            if ds_name is None:
+                for pref in ('images', 'frames', 'data'):
+                    if pref in f:
+                        ds_name = pref
+                        break
+            if ds_name is None:
+                for k in f.keys():
+                    if isinstance(f[k], h5py.Dataset):
+                        ds_name = k
+                        break
+            if ds_name is None:
+                self.error.emit('No dataset found in HDF5')
+                return
+
+            ds = f[ds_name]
+            n_frames = end_frame - start_frame + 1
+            temp_dir = tempfile.mkdtemp(prefix='h5_frames_')
+            for i in tqdm(range(start_frame, end_frame + 1), desc=f"Exporting frames {start_frame}-{end_frame} from HDF5..."):
+                arr = np.asarray(ds[i])
+                if arr.ndim == 2:
+                    out = cv2.cvtColor(arr.astype(np.uint8), cv2.COLOR_GRAY2BGR)
+                elif arr.ndim == 3 and arr.shape[2] == 3:
+                    # normalize to 0-255 if needed
+                    if arr.dtype != np.uint8:
+                        arrf = arr.astype(np.float32)
+                        m = arrf.max()
+                        if m == 0:
+                            out = (arrf * 0).astype(np.uint8)
+                        else:
+                            out = (255.0 * (arrf / m)).astype(np.uint8)
+                    else:
+                        out = arr.astype(np.uint8)
+                    # convert RGB->BGR if needed (assume RGB)
+                    out = cv2.cvtColor(out, cv2.COLOR_RGB2BGR)
+                else:
+                    # unsupported dim
+                    continue
+                
+                # NOTE: this temp folder preserves the same frame indexing as the HDF5
+                # (so not zero-based)
+                save_path = os.path.join(temp_dir, f"{i}.jpg")
+                cv2.imwrite(save_path, out)
+                # print(f"Exported frame {i} to {save_path}")
+                frames_processed = i - self.start_frame + 1
+                if frames_processed % max(1, n_frames // 100) == 0:
+                    pct = int(100.0 * frames_processed / n_frames)
+                    self.progress.emit(pct)                 
+
+        print(f"Temporary video directory created at {temp_dir}")
+        print("------- Finished exporting frames from HDF5 -------")
+        return temp_dir
+    
     def request_stop(self):
         """Request the worker to stop after the current iteration."""
         self._stop_requested = True
@@ -138,134 +442,450 @@ class TrackerWorker(QThread):
             resampled = [centerline[j] for j in indices]
             return resampled
 
+    def _initialize_model(self):
+        model_size = self.model_size
+        sam2_checkpoint, model_cfg = None, None
+        if self.checkpoint_path:
+            sam2_checkpoint = self.checkpoint_path
+        if model_size == 'tiny':
+            if not sam2_checkpoint:
+                sam2_checkpoint = "./checkpoints/sam2.1_hiera_tiny.pt"
+            model_cfg = "configs/sam2.1/sam2.1_hiera_t.yaml"
+        elif model_size == 'base':
+            if not sam2_checkpoint:
+                sam2_checkpoint = "./checkpoints/sam2.1_hiera_base_plus.pt"
+            model_cfg = "configs/sam2.1/sam2.1_hiera_b+.yaml"
+        elif model_size == 'large':
+            if not sam2_checkpoint:
+                sam2_checkpoint = "./checkpoints/sam2.1_hiera_large.pt"
+            model_cfg = "configs/sam2.1/sam2.1_hiera_l.yaml"
+        else:
+            self.error.emit(f"Unknown model size: {model_size}")
+        if not os.path.exists(sam2_checkpoint):
+            self.error.emit(f"Checkpoint not found: {sam2_checkpoint}")
+        return model_cfg, sam2_checkpoint
+
+    def _save_prompt_visualization(self, prompts, temp_video_path, batch_start_frame, output_dir):
+        """
+        Save a visualization of the prompts being used for this batch.
+        
+        Args:
+            prompts: list of prompt dicts
+            temp_video_path: path to temporary video directory
+            batch_start_frame: global frame index for this batch
+            output_dir: directory to save visualization
+        """
+        import os
+        os.makedirs(output_dir, exist_ok=True)
+        
+        # Load the first frame from the temp video
+        first_frame_path = os.path.join(temp_video_path, sorted(os.listdir(temp_video_path))[0])
+        img = cv2.imread(first_frame_path)
+        if img is None:
+            print(f"WARNING: Could not load frame for visualization: {first_frame_path}")
+            return
+        
+        # Create visualization overlay
+        vis_img = img.copy()
+        
+        # Define colors for different objects
+        obj_colors = [
+            (0, 255, 0),    # Green
+            (255, 0, 0),    # Blue
+            (0, 0, 255),    # Red
+            (255, 255, 0),  # Cyan
+            (255, 0, 255),  # Magenta
+            (0, 255, 255),  # Yellow
+        ]
+        
+        for prompt in prompts:
+            obj_id = prompt['obj_id']
+            color = obj_colors[(obj_id - 1) % len(obj_colors)]
+            
+            if 'points' in prompt:
+                # Draw point prompts
+                points = prompt['points']
+                labels = prompt['labels']
+                
+                for point, label in zip(points, labels):
+                    x, y = int(point[0]), int(point[1])
+                    if label == 1:  # Positive point
+                        cv2.circle(vis_img, (x, y), 5, color, -1)
+                        cv2.circle(vis_img, (x, y), 7, (255, 255, 255), 2)
+                    else:  # Negative point
+                        cv2.circle(vis_img, (x, y), 5, (0, 0, 0), -1)
+                        cv2.circle(vis_img, (x, y), 7, color, 2)
+                        # Draw X for negative points
+                        cv2.line(vis_img, (x-5, y-5), (x+5, y+5), color, 2)
+                        cv2.line(vis_img, (x-5, y+5), (x+5, y-5), color, 2)
+                
+                # Draw lines connecting the points to show centerline
+                if len(points) > 1:
+                    for i in range(len(points) - 1):
+                        pt1 = (int(points[i][0]), int(points[i][1]))
+                        pt2 = (int(points[i+1][0]), int(points[i+1][1]))
+                        cv2.line(vis_img, pt1, pt2, color, 1)
+                
+                # Add text label
+                if len(points) > 0:
+                    text_pos = (int(points[0][0]) + 10, int(points[0][1]) - 10)
+                    cv2.putText(vis_img, f"Obj {obj_id} ({len(points)} pts)", 
+                               text_pos, cv2.FONT_HERSHEY_SIMPLEX, 0.5, color, 2)
+            
+            elif 'mask' in prompt:
+                # Draw mask prompts as colored overlay
+                mask = prompt['mask']
+                mask_overlay = np.zeros_like(img)
+                mask_overlay[mask] = color
+                
+                # Blend with original image
+                vis_img = cv2.addWeighted(vis_img, 0.7, mask_overlay, 0.3, 0)
+                
+                # Draw mask boundary
+                contours, _ = cv2.findContours(mask.astype(np.uint8), 
+                                               cv2.RETR_EXTERNAL, 
+                                               cv2.CHAIN_APPROX_SIMPLE)
+                cv2.drawContours(vis_img, contours, -1, color, 2)
+                
+                # Add text label
+                if len(contours) > 0:
+                    M = cv2.moments(contours[0])
+                    if M["m00"] != 0:
+                        cx = int(M["m10"] / M["m00"])
+                        cy = int(M["m01"] / M["m00"])
+                        cv2.putText(vis_img, f"Obj {obj_id} (mask)", 
+                                   (cx, cy), cv2.FONT_HERSHEY_SIMPLEX, 0.5, color, 2)
+            
+            if 'negative_points' in prompt:
+                negative_points = prompt['negative_points']
+                red_bgr = (0, 0, 255)  # Red in BGR
+                
+                for point in negative_points:
+                    x, y = int(point[0]), int(point[1])
+                    cv2.circle(vis_img, (x, y), 5, red_bgr, -1)
+                    cv2.circle(vis_img, (x, y), 7, red_bgr, 2)
+                    # Draw X for negative points
+                    cv2.line(vis_img, (x-5, y-5), (x+5, y+5), red_bgr, 2)
+                    cv2.line(vis_img, (x-5, y+5), (x+5, y-5), red_bgr, 2)
+            # NEW: Draw eroded mask if available
+            
+            
+            if 'eroded_mask' in prompt:
+                eroded_mask = prompt['eroded_mask']
+                # Draw eroded mask boundary in a different color (lighter/dashed)
+                contours, _ = cv2.findContours(eroded_mask.astype(np.uint8), 
+                                            cv2.RETR_EXTERNAL, 
+                                            cv2.CHAIN_APPROX_SIMPLE)
+                # Draw with dashed line effect by drawing every other segment
+                for contour in contours:
+                    for i in range(0, len(contour), 2):
+                        if i + 1 < len(contour):
+                            pt1 = tuple(contour[i][0])
+                            pt2 = tuple(contour[i+1][0])
+                            cv2.line(vis_img, pt1, pt2, (200, 200, 200), 1)  # Light gray dashed
+                
+                # Also show as semi-transparent overlay
+                eroded_overlay = np.zeros_like(img)
+                eroded_overlay[eroded_mask] = (128, 128, 128)  # Gray
+                vis_img = cv2.addWeighted(vis_img, 0.85, eroded_overlay, 0.15, 0)
+
+            if 'dilated_mask' in prompt:
+                dilated_mask = prompt['dilated_mask']
+                # Draw dilated mask boundary in a different color (cyan/light blue)
+                contours, _ = cv2.findContours(dilated_mask.astype(np.uint8), 
+                                            cv2.RETR_EXTERNAL, 
+                                            cv2.CHAIN_APPROX_SIMPLE)
+                # Draw with dashed line effect
+                for contour in contours:
+                    for i in range(0, len(contour), 2):
+                        if i + 1 < len(contour):
+                            pt1 = tuple(contour[i][0])
+                            pt2 = tuple(contour[i+1][0])
+                            cv2.line(vis_img, pt1, pt2, (255, 255, 0), 1)  # Cyan dashed
+                
+                # Also show as semi-transparent overlay
+                dilated_overlay = np.zeros_like(img)
+                dilated_overlay[dilated_mask] = (255, 255, 0)  # Cyan
+                vis_img = cv2.addWeighted(vis_img, 0.90, dilated_overlay, 0.10, 0)
+        # Add batch info
+        cv2.putText(vis_img, f"Batch start frame: {batch_start_frame}", 
+                   (10, 30), cv2.FONT_HERSHEY_SIMPLEX, 1, (255, 255, 255), 2)
+        
+        # Save visualization
+        output_path = os.path.join(output_dir, f"prompts_batch_{batch_start_frame}.jpg")
+        cv2.imwrite(output_path, vis_img)
+        print(f"Saved prompt visualization to {output_path}")
+    
     def run(self):
         """
-        Given a temporary video folder path, runs SAM 2 tracking with the provided prompts.
-        (this temporary video folder is just the selected frames exported from the HDF5 file)
+        Given a video source (HDF5 file or directory of images), runs SAM 2 tracking with the provided prompts.
         """
         try:
+            print("Starting run method of TrackerWorker...")
+            
+            # Determine if source is HDF5 or directory
+            is_h5 = os.path.isfile(self.video_source) and self.video_source.endswith(('.h5', '.hdf5'))
+            print(f"Video source is HDF5: {is_h5}")
+            
             # 1. Setup Folders
-            video_dir_name = os.path.basename(os.path.normpath(self.video_path))
-            parent_dir = os.path.dirname(os.path.normpath(self.video_path))
+            # (self.save_mask_dir is either chosen, or the parent dir of the video)
             ts = datetime.now().strftime("%Y%m%d_%H%M%S")
+            video_name = os.path.basename(os.path.normpath(self.video_source))
             print(f"Chosen save_mask_dir: {self.save_mask_dir}")
-            mask_output_dir = os.path.join(self.save_mask_dir, f"{self.video_name}_masks_{ts}")
+            print(f"Video name: {video_name}")
+
+            mask_output_dir = os.path.join(self.save_mask_dir, f"{self.start_frame}_{self.end_frame}_{video_name}_masks_{ts}_{self.start_frame}_{self.end_frame if self.end_frame is not None else 'end'}")
             os.makedirs(mask_output_dir, exist_ok=True)
             print(f"Initialized mask output directory at: {mask_output_dir}")
 
             # 2. Initialize Model based on selected model_size
-            model_size = getattr(self, 'model_size', 'base')
-            if model_size == 'tiny':
-                sam2_checkpoint = "./checkpoints/sam2.1_hiera_tiny.pt"
-                model_cfg = "configs/sam2.1/sam2.1_hiera_t.yaml"
-            elif model_size == 'base':
-                sam2_checkpoint = "./checkpoints/sam2.1_hiera_base_plus.pt"
-                model_cfg = "configs/sam2.1/sam2.1_hiera_b+.yaml"
-            elif model_size == 'large':
-                sam2_checkpoint = "./checkpoints/sam2.1_hiera_large.pt"
-                model_cfg = "configs/sam2.1/sam2.1_hiera_l.yaml"
-            else:
-                self.error.emit(f"Unknown model size: {model_size}")
-                return
-            if not os.path.exists(sam2_checkpoint):
-                self.error.emit(f"Checkpoint not found: {sam2_checkpoint}")
-                return
-
-            
+            model_cfg, sam2_checkpoint = self._initialize_model()
             predictor = build_sam2_video_predictor(model_cfg, sam2_checkpoint, device=self.device)
-            inference_state = predictor.init_state(video_path=self.video_path)
-            print(f"Initialized inference state w video path: {self.video_path}")
-            
-            # 3. Add Prompts
-            for i, prompts in enumerate(self.scaled_blob_centers):
-                if not prompts:
-                    continue
-                ann_obj_id = i + 1
-                # prompts is a list of ((x, y), label) tuples
-                points = np.array([pt for pt, _ in prompts], dtype=np.float32)
-                labels = np.array([lbl for _, lbl in prompts], dtype=np.int32)
-                predictor.add_new_points_or_box(
-                    inference_state=inference_state,
-                    frame_idx=0, # 0 in the temporary folder
-                    obj_id=ann_obj_id,
-                    points=points,
-                    labels=labels,
-                )
+
+            # Store centerlines: {frame_idx: {obj_id: [(x, y), ...]}}
+            all_centerlines = {}
 
             # 4. Propagate and Save to Disk Immediately
             print(f"Propagating and saving masks to {mask_output_dir}...")
-            
-            # Get image dimensions from the first frame to ensure mask matches
-            first_frame_path = os.path.join(self.video_path, sorted(os.listdir(self.video_path))[0])
-            ref_img = cv2.imread(first_frame_path)
-            h, w = ref_img.shape[:2]
-            
-            # Store centerlines: {frame_idx: {obj_id: [(x, y), ...]}}
-            all_centerlines = {}
-            
-            for out_frame_idx, out_obj_ids, out_mask_logits in predictor.propagate_in_video(inference_state):
+            batch_start_frame = self.start_frame # start from chosen start frame
+            while batch_start_frame < self.end_frame:
                 if self._stop_requested:
                     break
-                save_frame_index = self.start_frame + out_frame_idx
-                # Create a black canvas for the color mask
-                color_mask = np.zeros((h, w, 3), dtype=np.uint8)
-                frame_centerlines = {}
-                
-                for i, out_obj_id in enumerate(out_obj_ids):
-                    # Get binary mask for this object
-                    mask = (out_mask_logits[i] > 0.0).cpu().numpy().squeeze()
-                    
-                    if mask.sum() > 0:
-                        # Resize if necessary (SAM output safety)
-                        if mask.shape != (h, w):
-                            mask = cv2.resize(mask.astype(np.uint8), (w, h), interpolation=cv2.INTER_NEAREST)
-                        
-                        # Get color for this object ID
-                        color = self.colors[out_obj_id % len(self.colors)]
-                        
-                        # Paint the color on the mask
-                        color_mask[mask > 0] = color
-                        
-                        # Extract centerline (skeleton) from mask
-                        try:
-                            # Skeletonize the binary mask
-                            skeleton = skeletonize(mask.astype(bool))
-                            # Get skeleton points
-                            skeleton_coords = np.column_stack(np.where(skeleton))
-                            if len(skeleton_coords) > 0:
-                                # Convert from (y, x) to (x, y)
-                                full_centerline = [(int(pt[1]), int(pt[0])) for pt in skeleton_coords]
-                                # Resample to desired number of points
-                                resampled_centerline = full_centerline
-                                if len(full_centerline) > 1:
-                                    resampled_centerline = self._interpolate_centerline(full_centerline, self.num_centerline_points)
-                                # Store as tuple: (full_skeleton, resampled_points)
-                                frame_centerlines[out_obj_id] = (full_centerline, resampled_centerline)
-                        except Exception as e:
-                            print(f"Failed to compute centerline for object {out_obj_id} in frame {save_frame_index}: {e}")
-                            frame_centerlines[out_obj_id] = ([], [])
+                batch_end_frame = min(batch_start_frame + self.batch_size, self.end_frame)
+                batch_num = (batch_start_frame - self.start_frame) // self.batch_size
+                print(f"Processing batch {batch_num + 1}: frames {batch_start_frame} to {batch_end_frame}")
 
-                # Save the pre-colored mask to the new folder as a compressed JPG
-                # Only save if within requested start/end frame range
-                save_path = os.path.join(mask_output_dir, f"{save_frame_index}.jpg")
-                # Use reasonable JPEG quality to keep files small but good-looking
-                cv2.imwrite(save_path, color_mask, [int(cv2.IMWRITE_JPEG_QUALITY), 90])
+                # Export temporary video segment for the current batch (only if HDF5)
+                if is_h5:
+                    temp_video_path = self.create_temp_video_dir_from_h5(batch_start_frame, batch_end_frame)
+                    created_temp_dir = True
+                else:
+                    # Use directory directly for image folders
+                    temp_video_path = self.video_source
+                    created_temp_dir = False
+
+                # Reinitialize inference state for each batch (to avoid memory issues)
+                inference_state = predictor.init_state(video_path=temp_video_path)
+                # add prompts for 1st batch
+                if batch_start_frame == self.start_frame:
+                    # Get image dimensions from the first frame to ensure mask matches
+                    first_frame_path = os.path.join(temp_video_path, sorted(os.listdir(temp_video_path))[0])
+                    ref_img = cv2.imread(first_frame_path)
+                    h, w = ref_img.shape[:2]
+                    
+                    for i, prompts in enumerate(self.scaled_blob_centers):
+                        if not prompts:
+                            continue
+                        ann_obj_id = i + 1
+                            # prompts is a list of ((x, y), label) tuples
+                        points = np.array([pt for pt, _ in prompts], dtype=np.float32)
+                        labels = np.array([lbl for _, lbl in prompts], dtype=np.int32)
+                        predictor.add_new_points_or_box(
+                            inference_state=inference_state,
+                            frame_idx=0,
+                            obj_id=ann_obj_id,
+                            points=points,
+                            labels=labels,
+                        )
+                # load mask from previous batch end as prompt
+                else:
+                    prompts_to_visualize = [] # for debugging/visualization
+                    for obj_id in range(len(self.scaled_blob_centers)):
+                        ann_obj_id = obj_id + 1
+                        last_mask_path = os.path.join(mask_output_dir, f"{batch_start_frame}_mask.jpg")
+
+                        if not os.path.exists(last_mask_path):
+                            raise FileNotFoundError(f"Required mask for frame {batch_start_frame} not found")
+                        
+                        mask_colour = cv2.imread(last_mask_path)
+                        mask_gray = cv2.cvtColor(mask_colour, cv2.COLOR_BGR2GRAY)
+                        mask_binary = np.where(mask_gray > 0, 255, 0).astype(np.uint8)
+                        
+                        # TODO: this currently only works if you're tracking only one object
+                        # need to modify to extract the object mask for each obj_id if want to support
+                        # multi-object tracking like so
+                        # predictor.add_new_mask(
+                        #     inference_state=inference_state,
+                        #     frame_idx=0,
+                        #     obj_id=ann_obj_id,
+                        #     mask=mask_binary.astype(bool) # Convert back to boolean mask
+                        # )
+                        kernel = np.ones((self.kernel_size, self.kernel_size), np.uint8)
+                        eroded_mask = cv2.erode(mask_binary, kernel, iterations=self.kernel_iterations)
+
+                        # Extract centerline
+                        skeleton = skeletonize(eroded_mask > 0)
+                        centerline_points = np.column_stack(np.where(skeleton > 0))[:, ::-1]
+                        
+                        # Sample centerline points
+                        if len(centerline_points) > 15:
+                            indices = np.linspace(0, len(centerline_points) - 1, self.num_positive_prompts, dtype=int)
+                            sampled_points = centerline_points[indices]
+                            # Add centerline as positive points
+                            labels = np.ones(len(sampled_points), dtype=np.int32)
+                        else:
+                            sampled_points = centerline_points
+                            labels = np.ones(len(sampled_points), dtype=np.int32)
+                        print(f"Added {len(sampled_points)} centerline points for object {ann_obj_id}")
+
+                        add_negative_points = True
+                        if add_negative_points:
+                                                    # NEW: Extract negative prompts from the boundary region
+                            # Dilate the original (non-eroded) mask to find the outer boundary
+                            kernel_dilate = np.ones((self.negative_kernel_size, self.negative_kernel_size), np.uint8)
+                            dilated_mask = cv2.dilate(mask_binary, kernel_dilate, iterations=self.negative_kernel_iterations)
+                            # Boundary region = dilated - original
+                            boundary_region = dilated_mask - mask_binary
+                            
+                            # Sample points from the boundary (negative prompts)
+                            boundary_pixels = np.column_stack(np.where(boundary_region > 0))[:, ::-1]
+                            negative_points = []
+                            negative_labels = []
+                            
+                            if len(boundary_pixels) > 0:
+                                # Sample ~10 negative points evenly around the boundary
+                                num_neg_points = min(self.num_negative_prompts, len(boundary_pixels))
+                                if len(boundary_pixels) > num_neg_points:
+                                    neg_indices = np.linspace(0, len(boundary_pixels) - 1, num_neg_points, dtype=int)
+                                    negative_points = boundary_pixels[neg_indices]
+                                else:
+                                    negative_points = boundary_pixels
+                                negative_labels = np.zeros(len(negative_points), dtype=np.int32)
+                            
+                            # Combine positive and negative points
+                            all_points = np.vstack([sampled_points, negative_points]) if len(negative_points) > 0 else sampled_points
+                            all_labels = np.concatenate([labels, negative_labels]) if len(negative_labels) > 0 else labels
+                            print(f"Added {len(negative_points)} negative points for object {ann_obj_id}")
+                        else:
+                            all_points = sampled_points
+                            all_labels = labels
+
+                        predictor.add_new_points_or_box(
+                            inference_state=inference_state,
+                            frame_idx=0,
+                            obj_id=ann_obj_id,
+                            points=all_points,
+                            labels=all_labels,
+                        )
+                                                # Store for visualization
+                        # Store for visualization
+                        prompt_dict = {
+                            'obj_id': ann_obj_id,
+                            'points': sampled_points,
+                            'labels': labels,
+                            'frame_idx': 0,
+                            'eroded_mask': eroded_mask.astype(bool),
+                        }
+                        
+                        # Only add dilated_mask if negative points are being used
+                        if add_negative_points:
+                            prompt_dict['dilated_mask'] = dilated_mask.astype(bool)
+                            prompt_dict['negative_points'] = negative_points
+                        
+                        prompts_to_visualize.append(prompt_dict)
+                    # Save visualization of prompts for this batch
+                    prompt_vis_dir = os.path.join(mask_output_dir, f"batch_prompts")
+                    self._save_prompt_visualization(prompts_to_visualize, temp_video_path, batch_start_frame, prompt_vis_dir)
                 
-                # Store centerlines for this frame
-                all_centerlines[save_frame_index] = frame_centerlines
+                # DEBUG: Check what's in the inference_state after adding prompts/masks
+                # DEBUG: Check what's in the inference_state after adding prompts/masks
+                print("\n=== DEBUGGING INFERENCE STATE ===")
+                print(f"Batch start frame: {batch_start_frame}")
+                print(f"Is first batch: {batch_start_frame == self.start_frame}")
+                print(f"Inference state type: {type(inference_state)}")
+                print(f"Inference state keys: {list(inference_state.keys())}")
                 
-                # Emit that mask was saved (so GUI can update its index and display)
-                try:
+                # Check for common keys in SAM2 inference state
+                if 'obj_ids' in inference_state:
+                    print(f"Object IDs in state: {inference_state['obj_ids']}")
+                if 'obj_id_to_idx' in inference_state:
+                    print(f"Object ID to index mapping: {inference_state['obj_id_to_idx']}")
+                if 'point_inputs_per_obj' in inference_state:
+                    print(f"Point inputs per object: {list(inference_state['point_inputs_per_obj'].keys())}")
+                    for obj_id, frame_dict in inference_state['point_inputs_per_obj'].items():
+                        print(f"  Object {obj_id}: frames {list(frame_dict.keys())}")
+                if 'mask_inputs_per_obj' in inference_state:
+                    print(f"Mask inputs per object: {list(inference_state['mask_inputs_per_obj'].keys())}")
+                    for obj_id, frame_dict in inference_state['mask_inputs_per_obj'].items():
+                        print(f"  Object {obj_id}: frames {list(frame_dict.keys())}")
+                if 'output_dict' in inference_state:
+                    print(f"Output dict keys: {list(inference_state['output_dict'].keys())}")
+                
+                # Print all keys to see what's actually stored
+                print("\nAll inference_state contents:")
+                for key in inference_state.keys():
+                    val = inference_state[key]
+                    if isinstance(val, dict):
+                        print(f"  {key}: dict with keys {list(val.keys())[:5]}{'...' if len(val) > 5 else ''}")
+                    elif isinstance(val, list):
+                        print(f"  {key}: list of length {len(val)}")
+                    else:
+                        print(f"  {key}: {type(val).__name__}")
+                
+                print("=== END DEBUG ===\n")
+                # breakpoint()
+                for out_frame_idx, out_obj_ids, out_mask_logits in predictor.propagate_in_video(inference_state):
+                    if self._stop_requested:
+                        break
+                    save_frame_index = batch_start_frame + out_frame_idx
+                    print(f"saving local {out_frame_idx} as {save_frame_index}...")
+                    color_mask = np.zeros((h, w, 3), dtype=np.uint8)
+                    frame_centerlines = {}
+                    for i, out_obj_id in enumerate(out_obj_ids):
+                        # Get binary mask for this object
+                        mask = (out_mask_logits[i] > 0.0).cpu().numpy().squeeze()
+                        if mask.sum() > 0:
+                            # Resize if necessary (SAM output safety)
+                            if mask.shape != (h, w):
+                                mask = cv2.resize(mask.astype(np.uint8), (w, h), interpolation=cv2.INTER_NEAREST)
+
+                            # Get color for this object ID
+                            color = self.colors[out_obj_id % len(self.colors)]
+                            
+                            # Paint the color on the mask
+                            color_mask[mask > 0] = color
+                            
+                            # Extract centerline (skeleton) from mask
+                            try:
+                                # Skeletonize the binary mask
+                                skeleton = skeletonize(mask.astype(bool))
+                                # Get skeleton points
+                                skeleton_coords = np.column_stack(np.where(skeleton))
+                                if len(skeleton_coords) > 0:
+                                    # Convert from (y, x) to (x, y)
+                                    full_centerline = [(int(pt[1]), int(pt[0])) for pt in skeleton_coords]
+                                    # Resample to desired number of points
+                                    resampled_centerline = full_centerline
+                                    if len(full_centerline) > 1:
+                                        resampled_centerline = self._interpolate_centerline(full_centerline, self.num_centerline_points)
+                                    # Store as tuple: (full_skeleton, resampled_points)
+                                    frame_centerlines[out_obj_id] = (full_centerline, resampled_centerline)
+                            except Exception as e:
+                                print(f"Failed to compute centerline for object {out_obj_id} in frame {save_frame_index}: {e}")
+                                frame_centerlines[out_obj_id] = ([], [])
+
+                    # Save the pre-colored mask to the new folder as a compressed JPG
+                    save_path = os.path.join(mask_output_dir, f"{save_frame_index}_mask.jpg")
+                    cv2.imwrite(save_path, color_mask)
+                    
+                    # Store centerlines for this frame
+                    all_centerlines[save_frame_index] = frame_centerlines
+                    
+                    # Emit mask was saved (so GUI can update its index and display)
                     self.maskSaved.emit(save_frame_index, save_path)
-                except Exception:
-                    pass
-                
-                # Emit centerlines for this frame
-                try:
                     self.centerlineComputed.emit(save_frame_index, frame_centerlines)
-                except Exception:
-                    pass
-            
+
+                # Cleanup temporary directory only if it was created from HDF5
+                if created_temp_dir and temp_video_path and os.path.exists(temp_video_path):
+                    try:
+                        import shutil
+                        shutil.rmtree(temp_video_path)
+                        print(f"Cleaned up temporary directory: {temp_video_path}")
+                    except Exception as cleanup_error:
+                        print(f"Warning: Failed to cleanup temp directory {temp_video_path}: {cleanup_error}")
+
+                print(f"Finished processing batch {batch_num + 1}")
+                batch_start_frame += self.batch_size
             # Save all centerlines to numpy file
             centerlines_path = os.path.join(mask_output_dir, "centerlines.npy")
             try:
@@ -282,23 +902,29 @@ class TrackerWorker(QThread):
             self.error.emit(str(e))# --- GUI Components ---
 
 class ImageLoader(QThread):
-    """Background loader that reads frames and (optionally) pre-colored masks,
-    composes them (mask blending) and emits RGB numpy arrays to the GUI thread.
-    The GUI thread converts to QPixmap and caches the scaled pixmap.
+    """Background loader that reads raw frames (and masks if available) from disk/HDF5.
+    Emits (idx, img_rgb, mask_rgb_or_None) — mask is loaded once here so the GUI
+    thread never hits disk again for opacity/zoom/pan changes.
+
+    Uses a "latest request wins" queue so the current frame always jumps the queue.
     """
-    frameLoaded = pyqtSignal(int, object)
+    frameLoaded = pyqtSignal(int, object, object)
 
     def __init__(self, parent=None):
         super().__init__(parent)
-        self._req_q = Queue()
         self._running = True
-        # references (set by GUI) to lists/dicts owned by GUI
+
+        self._priority_idx = None
+        self._prefetch_set = set()
+        import threading
+        self._lock = threading.Lock()
+        self._event = threading.Event()
+
         self.image_files = None
         self.mask_files = None
-        # optional HDF5 reference
         self.h5_path = None
         self.h5_dataset = None
-        # internal HDF5 handle opened in this thread (open once for efficiency)
+
         self._h5f = None
         self._h5_n_frames = None
 
@@ -307,371 +933,207 @@ class ImageLoader(QThread):
         self.mask_files = mask_files
         self.h5_path = h5_path
         self.h5_dataset = h5_dataset
-        self.gui_instance = gui_instance  # Reference to GUI for opacity value
-        # reset per-thread HDF5 info; actual file handle will be opened inside run()
         self._h5_n_frames = None
-        # if image_files given and it's a list, we keep it; otherwise None
 
-    def request(self, idx):
-        try:
-            self._req_q.put_nowait(idx)
-        except Exception:
-            try:
-                self._req_q.put(idx)
-            except Exception:
-                pass
+    def request(self, idx, priority=True):
+        import threading
+        with self._lock:
+            if priority:
+                self._priority_idx = idx
+                self._prefetch_set.discard(idx)
+            else:
+                if idx != self._priority_idx:
+                    self._prefetch_set.add(idx)
+        self._event.set()
+
+    def _next_idx(self):
+        import threading
+        with self._lock:
+            if self._priority_idx is not None:
+                idx = self._priority_idx
+                self._priority_idx = None
+                return idx
+            if self._prefetch_set:
+                return self._prefetch_set.pop()
+        return None
+
+    def _load_raw_image(self, idx):
+        if self.h5_path is not None:
+            if not H5PY_AVAILABLE:
+                return None
+            if self._h5f is None:
                 try:
-                    if hasattr(self, '_realtime_worker') and getattr(self, '_realtime_worker') is not None:
-                        if getattr(self._realtime_worker, '_paused', False):
-                            # resume
-                            try:
-                                self._realtime_worker.resume()
-                                self.btn_pause_realtime.setText("Pause Tracking")
-                                self.status_label.setText("Real-time tracking: resumed")
-                            except Exception:
-                                pass
-                        else:
-                            # pause
-                            try:
-                                self._realtime_worker.pause()
-                                self.btn_pause_realtime.setText("Resume Tracking")
-                                self.status_label.setText("Real-time tracking: paused")
-                            except Exception:
-                                pass
+                    self._h5f = h5py.File(self.h5_path, 'r')
+                    ds_name = self.h5_dataset or next(iter(self._h5f.keys()))
+                    self._h5_dataset_name_internal = ds_name
+                    self._h5_n_frames = self._h5f[ds_name].shape[0]
                 except Exception:
-                    pass
+                    try:
+                        if self._h5f is not None:
+                            self._h5f.close()
+                    except Exception:
+                        pass
+                    self._h5f = None
+                    return None
+            if idx < 0 or (self._h5_n_frames is not None and idx >= self._h5_n_frames):
+                return None
+            try:
+                arr = np.asarray(self._h5f[self._h5_dataset_name_internal][idx])
+                if arr.ndim == 2:
+                    return cv2.cvtColor(arr.astype(np.uint8), cv2.COLOR_GRAY2RGB)
+                elif arr.ndim == 3 and arr.shape[2] == 3:
+                    if arr.dtype != np.uint8:
+                        arrf = arr.astype(np.float32)
+                        m = arrf.max()
+                        return (255.0 * (arrf / m)).astype(np.uint8) if m > 0 else arrf.astype(np.uint8)
+                    return arr.astype(np.uint8)
+            except Exception:
+                return None
+        else:
+            if self.image_files is None or idx < 0 or idx >= len(self.image_files):
+                return None
+            img = cv2.imread(self.image_files[idx])
+            if img is None:
+                return None
+            return cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
+
+    def _load_mask(self, idx):
+        """Load mask as RGB. Returns None if no mask for this frame."""
+        if not self.mask_files or idx not in self.mask_files:
+            return None
+        mask_bgr = cv2.imread(self.mask_files[idx])
+        if mask_bgr is None:
+            return None
+        mask_rgb = cv2.cvtColor(mask_bgr, cv2.COLOR_BGR2RGB)
+        return mask_rgb
 
     def run(self):
         while self._running:
-            try:
-                idx = self._req_q.get(timeout=0.1)
-            except Empty:
-                continue
-            if idx is None:
-                continue
-            try:
-                # Allow either file-based image list or HDF5-backed dataset
-                if self.image_files is None and self.h5_path is None:
-                    # nothing to load
-                    continue
-
-                # If using HDF5, ensure we have dataset length and an open handle
-                if self.h5_path is not None:
-                    if not H5PY_AVAILABLE:
-                        continue
-                    # open HDF5 file once in this thread for efficiency
-                    if self._h5f is None:
-                        try:
-                            self._h5f = h5py.File(self.h5_path, 'r')
-                            ds_name = self.h5_dataset
-                            if ds_name is None:
-                                # pick the first dataset
-                                ds_name = next(iter(self._h5f.keys()))
-                            self._h5_dataset_name_internal = ds_name
-                            self._h5_n_frames = self._h5f[ds_name].shape[0]
-                        except Exception:
-                            # failed to open HDF5 in loader thread
-                            try:
-                                if self._h5f is not None:
-                                    self._h5f.close()
-                                self._h5f = None
-                            except Exception:
-                                pass
-                            continue
-
-                    # bounds check using HDF5 length
-                    if idx < 0 or (self._h5_n_frames is not None and idx >= self._h5_n_frames):
-                        continue
-
-                    try:
-                        ds = self._h5f[self._h5_dataset_name_internal]
-                        arr = np.asarray(ds[idx])
-                        # if grayscale expand to 3 channels
-                        if arr.ndim == 2:
-                            img_rgb = cv2.cvtColor(arr.astype(np.uint8), cv2.COLOR_GRAY2RGB)
-                        elif arr.ndim == 3 and arr.shape[2] == 3:
-                            if arr.dtype != np.uint8:
-                                # normalize to 0-255
-                                arrf = arr.astype(np.float32)
-                                m = arrf.max()
-                                if m == 0:
-                                    img_rgb = (arrf * 0).astype(np.uint8)
-                                else:
-                                    img_rgb = (255.0 * (arrf / m)).astype(np.uint8)
-                            else:
-                                img_rgb = arr.astype(np.uint8)
-                        else:
-                            # unsupported shape
-                            continue
-                    except Exception:
-                        continue
-                else:
-                    # file-based images
-                    if idx < 0 or idx >= len(self.image_files):
-                        continue
-                    path = self.image_files[idx]
-                    img = cv2.imread(path)
-                    if img is None:
-                        continue
-                    img_rgb = cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
-
-                # compose mask if available
-                if self.mask_files and idx in self.mask_files:
-                    mask_path = self.mask_files[idx]
-                    mask_bgr = cv2.imread(mask_path)
-                    if mask_bgr is not None:
-                        mask_rgb = cv2.cvtColor(mask_bgr, cv2.COLOR_BGR2RGB)
-                        if mask_rgb.shape[:2] != img_rgb.shape[:2]:
-                            mask_rgb = cv2.resize(mask_rgb, (img_rgb.shape[1], img_rgb.shape[0]), interpolation=cv2.INTER_NEAREST)
-                        mask_indices = np.any(mask_rgb != [0, 0, 0], axis=-1)
-                        # Get opacity from GUI (default 0.5 if not available)
-                        opacity = 0.5
-                        if hasattr(self, 'gui_instance') and self.gui_instance is not None:
-                            try:
-                                opacity = self.gui_instance.mask_opacity
-                            except Exception:
-                                pass
-                        # ensure copy before modifying
-                        img_rgb = img_rgb.copy()
-                        img_rgb[mask_indices] = cv2.addWeighted(img_rgb[mask_indices], 1.0 - opacity, mask_rgb[mask_indices], opacity, 0)
-
-                # emit the composed RGB image (numpy array)
-                self.frameLoaded.emit(idx, img_rgb)
-            except Exception:
-                # ignore per-frame errors
-                continue
-
-    def stop(self):
-        self._running = False
-        try:
-            self._req_q.put(None)
-        except Exception:
-            pass
-
-class ExportH5Worker(QThread):
-    """Export frames from an HDF5 dataset to a temporary folder as JPEGs.
-    Emits `finished(temp_folder)` when done, `progress(int)` updates, and `error(str)` on failure.
-    """
-    finished = pyqtSignal(str)
-    progress = pyqtSignal(int)
-    ready = pyqtSignal(str)
-    error = pyqtSignal(str)
-
-    def __init__(self, h5_path, start_frame, end_frame, dataset_name=None):
-        super().__init__()
-        self.h5_path = h5_path
-        self.start_frame = start_frame
-        self.end_frame = end_frame
-        self.dataset_name = dataset_name
-        # stream_mode: if True, emit `ready` after writing initial frames so consumer can start
-        self.stream_mode = False
-        self.stream_threshold = 10
-        print(f"Initialized ExportH5Worker with start_frame={start_frame}, end_frame={end_frame}, dataset_name={dataset_name}")
-
-    def run(self):
-        if not H5PY_AVAILABLE:
-            self.error.emit("h5py not available")
-            return
-        try:
-            with h5py.File(self.h5_path, 'r') as f:
-                ds_name = self.dataset_name
-                if ds_name is None:
-                    # pick preferred dataset names or first dataset
-                    for pref in ('images', 'frames', 'data'):
-                        if pref in f:
-                            ds_name = pref
-                            break
-                if ds_name is None:
-                    for k in f.keys():
-                        if isinstance(f[k], h5py.Dataset):
-                            ds_name = k
-                            break
-                if ds_name is None:
-                    self.error.emit('No dataset found in HDF5')
-                    return
-
-                ds = f[ds_name]
-                # n_frames = ds.shape[0]
-                n_frames = self.end_frame - self.start_frame + 1
-                temp_dir = tempfile.mkdtemp(prefix='h5_frames_')
-                print(f"{self.start_frame}, {self.end_frame}")
-                for i in tqdm(range(self.start_frame, self.end_frame + 1), desc=f"Exporting frames from HDF5..."):
-                    try:
-                        arr = np.asarray(ds[i])
-                        if arr.ndim == 2:
-                            out = cv2.cvtColor(arr.astype(np.uint8), cv2.COLOR_GRAY2BGR)
-                        elif arr.ndim == 3 and arr.shape[2] == 3:
-                            if arr.dtype != np.uint8:
-                                # normalize to 0-255
-                                arrf = arr.astype(np.float32)
-                                m = arrf.max()
-                                if m == 0:
-                                    out = (arrf * 0).astype(np.uint8)
-                                else:
-                                    out = (255.0 * (arrf / m)).astype(np.uint8)
-                            else:
-                                out = arr.astype(np.uint8)
-                            # convert RGB->BGR if needed (assume RGB)
-                            out = cv2.cvtColor(out, cv2.COLOR_RGB2BGR)
-                        else:
-                            # unsupported dim
-                            continue
-
-                        save_path = os.path.join(temp_dir, f"{i}.jpg")
-                        cv2.imwrite(save_path, out, [int(cv2.IMWRITE_JPEG_QUALITY), 90])
-                        frames_processed = i - self.start_frame + 1
-                        if frames_processed % max(1, n_frames // 100) == 0:
-                            pct = int(100.0 * frames_processed / n_frames)
-                            self.progress.emit(pct)
-
-                        # if streaming, emit ready once we've written enough frames to start
-                        if self.stream_mode and frames_processed == min(self.stream_threshold, n_frames):
-                            try:
-                                print("Emitting ready signal from ExportH5Worker")
-                                self.ready.emit(temp_dir)
-                            except Exception:
-                                pass
-                        elif frames_processed == n_frames:
-                            try:
-                                print("Emitting ready signal from ExportH5Worker")
-                                self.ready.emit(temp_dir)
-                            except Exception:
-                                pass                          
-                    except Exception as e:
-                        print(f"Skipping processing frame {i}: {e}")
-                        # skip problematic frames
-                        continue
-            self.finished.emit(temp_dir)
-        except Exception as e:
-            import traceback
-            traceback.print_exc()
-            self.error.emit(str(e))
-
-class RealTimeTrackerWorker(QThread):
-    """Tracker that emits masks per-frame so GUI can display them in real time.
-    Signals:
-      frameMask(int, np.ndarray): emits (frame_idx, color_mask_bgr)
-      finished(str): emits mask folder path when done
-      error(str)
-    Supports pause()/resume()/stop().
-    """
-    frameMask = pyqtSignal(int, object)
-    finished = pyqtSignal(str)
-    error = pyqtSignal(str)
-
-    def __init__(self, video_path, device, scaled_blob_centers, colors=None, model_size='base', start_frame=0, end_frame=None):
-        super().__init__()
-        self.video_path = video_path
-        self.device = device
-        self.scaled_blob_centers = scaled_blob_centers
-        self.model_size = model_size
-        self._running = True
-        self._paused = False
-        self.start_frame = int(start_frame) if start_frame is not None else 0
-        self.end_frame = int(end_frame) if end_frame is not None else None
-        if colors is None:
-            self.colors = np.random.randint(0, 255, (100, 3), dtype=np.uint8)
-        else:
-            self.colors = colors
-
-    def pause(self):
-        self._paused = True
-
-    def resume(self):
-        self._paused = False
-
-    def stop(self):
-        self._running = False
-
-    def run(self):
-        try:
-            # similar init to TrackerWorker
-            video_dir_name = os.path.basename(os.path.normpath(self.video_path))
-            parent_dir = os.path.dirname(os.path.normpath(self.video_path))
-            mask_output_dir = os.path.join(parent_dir, f"{video_dir_name}_masks")
-            os.makedirs(mask_output_dir, exist_ok=True)
-
-            model_size = getattr(self, 'model_size', 'base')
-            if model_size == 'tiny':
-                sam2_checkpoint = "./checkpoints/sam2.1_hiera_tiny.pt"
-                model_cfg = "configs/sam2.1/sam2.1_hiera_t.yaml"
-            elif model_size == 'base':
-                sam2_checkpoint = "./checkpoints/sam2.1_hiera_base_plus.pt"
-                model_cfg = "configs/sam2.1/sam2.1_hiera_b+.yaml"
-            elif model_size == 'large':
-                sam2_checkpoint = "./checkpoints/sam2.1_hiera_large.pt"
-                model_cfg = "configs/sam2.1/sam2.1_hiera_l.yaml"
-            else:
-                self.error.emit(f"Unknown model size: {model_size}")
-                return
-
-            if not os.path.exists(sam2_checkpoint):
-                self.error.emit(f"Checkpoint not found: {sam2_checkpoint}")
-                return
-
-            # initialize predictor with video path
-            predictor = build_sam2_video_predictor(model_cfg, sam2_checkpoint, device=self.device)
-            inference_state = predictor.init_state(video_path=self.video_path)
-            for i, prompts in enumerate(self.scaled_blob_centers):
-                if not prompts:
-                    continue
-                ann_obj_id = i + 1
-                # prompts is a list of ((x, y), label) tuples
-                points = np.array([pt for pt, _ in prompts], dtype=np.float32)
-                labels = np.array([lbl for _, lbl in prompts], dtype=np.int32)
-                predictor.add_new_points_or_box(
-                    inference_state=inference_state,
-                    frame_idx=0,
-                    obj_id=ann_obj_id,
-                    points=points,
-                    labels=labels,
-                )
-            first_frame_path = os.path.join(self.video_path, sorted(os.listdir(self.video_path))[0])
-            ref_img = cv2.imread(first_frame_path)
-            h, w = ref_img.shape[:2]
-
-            for out_frame_idx, out_obj_ids, out_mask_logits in predictor.propagate_in_video(inference_state):
+            self._event.wait(timeout=0.1)
+            self._event.clear()
+            while True:
+                idx = self._next_idx()
+                if idx is None:
+                    break
                 if not self._running:
-                    break
-                # respect pause
-                while self._paused and self._running:
-                    QThread.msleep(100)
+                    return
+                if self.image_files is None and self.h5_path is None:
+                    continue
+                try:
+                    img_rgb = self._load_raw_image(idx)
+                    if img_rgb is None:
+                        continue
+                    mask_rgb = self._load_mask(idx)
+                    if mask_rgb is not None and mask_rgb.shape[:2] != img_rgb.shape[:2]:
+                        mask_rgb = cv2.resize(mask_rgb, (img_rgb.shape[1], img_rgb.shape[0]),
+                                              interpolation=cv2.INTER_NEAREST)
+                    self.frameLoaded.emit(idx, img_rgb, mask_rgb)
+                except Exception:
+                    continue
 
-                # assemble color mask
-                color_mask = np.zeros((h, w, 3), dtype=np.uint8)
-                for i, out_obj_id in enumerate(out_obj_ids):
-                    mask = (out_mask_logits[i] > 0.0).cpu().numpy().squeeze()
-                    if mask.sum() > 0:
-                        if mask.shape != (h, w):
-                            mask = cv2.resize(mask.astype(np.uint8), (w, h), interpolation=cv2.INTER_NEAREST)
-                        color = self.colors[out_obj_id % len(self.colors)]
-                        color_mask[mask > 0] = color
+    def stop(self):
+        self._running = False
+        self._event.set()
 
-                # emit for GUI to display (only if within range)
-                if out_frame_idx >= self.start_frame and (self.end_frame is None or out_frame_idx <= self.end_frame):
-                    try:
-                        self.frameMask.emit(out_frame_idx, color_mask.copy())
-                    except Exception:
-                        pass
-                    # save mask
-                    save_path = os.path.join(mask_output_dir, f"{out_frame_idx}.jpg")
-                    try:
-                        cv2.imwrite(save_path, color_mask, [int(cv2.IMWRITE_JPEG_QUALITY), 90])
-                    except Exception:
-                        pass
+class CoordinateMapper:
+    """Pure static-method class for converting between display-pixel and original-image coordinates."""
 
-                # stop early if we've passed end_frame
-                if self.end_frame is not None and out_frame_idx > self.end_frame:
-                    break
+    @staticmethod
+    def _pixmap_size(label_w: int, label_h: int, orig_w: int, orig_h: int, zoom_level: float):
+        """Return (pixmap_w, pixmap_h) — the size of the pixmap drawn inside the label."""
+        if zoom_level > 1.0:
+            # At zoom > 1 the crop is scaled to fill the label exactly (no letterboxing)
+            return label_w, label_h
+        else:
+            # At zoom == 1 the full image is fit-to-window preserving aspect ratio
+            scale = min(label_w / orig_w, label_h / orig_h)
+            return orig_w * scale, orig_h * scale
 
-            # finished
-            self.finished.emit(mask_output_dir)
-        except Exception as e:
-            import traceback
-            traceback.print_exc()
-            self.error.emit(str(e))
+    @staticmethod
+    def display_to_image(
+        display_x: float, display_y: float,
+        label_w: int, label_h: int,
+        orig_w: int, orig_h: int,
+        zoom_level: float,
+        pan_offset: tuple,
+    ) -> tuple:
+        """Convert a display-pixel position to original-image coordinates."""
+        pixmap_w, pixmap_h = CoordinateMapper._pixmap_size(label_w, label_h, orig_w, orig_h, zoom_level)
+
+        # Remove label-centering offset (letterbox bars at zoom=1)
+        offset_x = (label_w - pixmap_w) / 2
+        offset_y = (label_h - pixmap_h) / 2
+        x_in_pixmap = display_x - offset_x
+        y_in_pixmap = display_y - offset_y
+
+        # Fractional position within the pixmap
+        frac_x = x_in_pixmap / pixmap_w
+        frac_y = y_in_pixmap / pixmap_h
+
+        # Viewport size in image-space — must use label aspect ratio, not image aspect ratio
+        base_scale = min(label_w / orig_w, label_h / orig_h)
+        viewport_w = label_w / (base_scale * zoom_level)
+        viewport_h = label_h / (base_scale * zoom_level)
+
+        img_x = pan_offset[0] + frac_x * viewport_w
+        img_y = pan_offset[1] + frac_y * viewport_h
+
+        return img_x, img_y
+
+    @staticmethod
+    def image_to_display(
+        img_x: float, img_y: float,
+        label_w: int, label_h: int,
+        orig_w: int, orig_h: int,
+        zoom_level: float,
+        pan_offset: tuple,
+    ) -> tuple:
+        """Convert an original-image coordinate to display-pixel position."""
+        pixmap_w, pixmap_h = CoordinateMapper._pixmap_size(label_w, label_h, orig_w, orig_h, zoom_level)
+
+        offset_x = (label_w - pixmap_w) / 2
+        offset_y = (label_h - pixmap_h) / 2
+
+        base_scale = min(label_w / orig_w, label_h / orig_h)
+        viewport_w = label_w / (base_scale * zoom_level)
+        viewport_h = label_h / (base_scale * zoom_level)
+
+        frac_x = (img_x - pan_offset[0]) / viewport_w
+        frac_y = (img_y - pan_offset[1]) / viewport_h
+
+        display_x = offset_x + frac_x * pixmap_w
+        display_y = offset_y + frac_y * pixmap_h
+
+        return display_x, display_y
+
+    @staticmethod
+    def viewport_crop(
+        label_w: int, label_h: int,
+        orig_w: int, orig_h: int,
+        zoom_level: float,
+        pan_offset: tuple,
+    ) -> tuple:
+        """Return (x0, y0, x1, y1) crop rectangle in original-image pixels, clamped to image bounds.
+
+        The viewport size is derived from the label's aspect ratio so the crop
+        matches exactly what gets stretched into the label — no distortion.
+        """
+        # The base scale is the same fit-to-window scale used at zoom=1
+        base_scale = min(label_w / orig_w, label_h / orig_h)
+        # At zoom_level Z the visible region in image-space is:
+        viewport_w = label_w / (base_scale * zoom_level)
+        viewport_h = label_h / (base_scale * zoom_level)
+
+        x0 = max(0.0, min(pan_offset[0], orig_w - viewport_w))
+        y0 = max(0.0, min(pan_offset[1], orig_h - viewport_h))
+        x1 = x0 + viewport_w
+        y1 = y0 + viewport_h
+
+        return int(x0), int(y0), int(x1), int(y1)
+
 
 class C_Elegans_GUI(QMainWindow):
+
     def __init__(self):
         super().__init__()
         self.setWindowTitle("C. Elegans Tracker (SAM 2)")
@@ -702,15 +1164,22 @@ class C_Elegans_GUI(QMainWindow):
         self.autoseg_frame_idx = None
         self.tracking_results = None # Stores result of SAM 2
         self.colors = np.random.randint(0, 255, (100, 3), dtype=np.uint8) # Pre-generate 100 random colors
-        # Mapping from frame_idx -> mask file path (pre-colored JPGs)
+        # Mapping from frame_idx -> mask file path (pre-colored JPGs) — kept for prompt seeding
         self.tracking_mask_files = {}
         # Mapping from frame_idx -> {obj_id: [(x, y), ...]} centerline points
         self.centerlines = {}
-        # Mask opacity (0.0 to 1.0, where 1.0 = fully opaque)
+        # Mask opacity (0.0 to 1.0)
         self.mask_opacity = 0.5
-        # Simple in-memory cache for recently-used color masks to speed up display
-        self._mask_cache = {}
-        self._mask_cache_max = 64
+        # Prompt point size for visualization
+        self.prompt_point_size = 5.0
+        # Raw frame cache: stores (img_rgb, mask_rgb) — never blended, used as source of truth
+        self._raw_frame_cache = OrderedDict()
+        self._raw_frame_cache_max = 64
+        # Blended cache: stores pre-blended full-res composite keyed by frame idx.
+        # Invalidated only when opacity changes or a new mask arrives — NOT on zoom/pan.
+        # This makes zoom/pan free: just crop+resize the cached composite.
+        self._blended_cache = OrderedDict()
+        self._blended_cache_max = 64
         # Pixmap cache (scaled QPixmaps) for fast display
         # Use OrderedDict for LRU behavior (most-recently-used at end)
         self.pixmap_cache = OrderedDict()
@@ -728,6 +1197,11 @@ class C_Elegans_GUI(QMainWindow):
 
         # Mask output directory (can be changed via sidebar)
         self.save_mask_dir = "/Users/huayinluo/Documents/code/zhenlab/MultiscaleSEM/masks"
+        # Parent directory of current video (for optional use as mask output)
+        self.video_parent_dir = None
+        # Whether to use parent dir for masks instead of save_mask_dir
+        self.use_parent_dir_for_masks = USE_PARENT_DIR_FOR_MASKS
+
 
         # Setup Device
         if torch.cuda.is_available():
@@ -750,7 +1224,7 @@ class C_Elegans_GUI(QMainWindow):
 
         self.setup_selection_screen()
         self.setup_tracking_screen()
-        self.apply_professional_purple_theme()
+        # self.apply_professional_purple_theme()
         self._apply_clickable_cursors()
 
         # Background image loader thread
@@ -761,6 +1235,11 @@ class C_Elegans_GUI(QMainWindow):
         self._image_loader.set_references(self.image_files, self.tracking_mask_files, gui_instance=self)
         # temp dir used when exporting HDF5 frames for tracking
         self._h5_export_tempdir = None
+
+        # Zoom / pan state
+        self.zoom_level: float = 1.0
+        self.pan_offset: tuple = (0.0, 0.0)
+        self._pan_start_pos = None
 
     def apply_professional_purple_theme(self):
         """Apply a cohesive purple theme to the full application UI."""
@@ -802,13 +1281,6 @@ class C_Elegans_GUI(QMainWindow):
                 self.worker = None
         except Exception:
             pass
-        try:
-            if hasattr(self, '_realtime_worker') and getattr(self, '_realtime_worker', None) is not None and self._realtime_worker.isRunning():
-                self._realtime_worker.stop()
-                self._realtime_worker.wait(2000)
-                self._realtime_worker = None
-        except Exception:
-            pass
 
         # clear temp dirs
         try:
@@ -839,7 +1311,14 @@ class C_Elegans_GUI(QMainWindow):
         self.centerlines = {}
 
         # clear caches
-        self._mask_cache = {}
+        try:
+            self._raw_frame_cache.clear()
+        except Exception:
+            self._raw_frame_cache = OrderedDict()
+        try:
+            self._blended_cache.clear()
+        except Exception:
+            self._blended_cache = OrderedDict()
         try:
             self.pixmap_cache.clear()
         except Exception:
@@ -861,8 +1340,6 @@ class C_Elegans_GUI(QMainWindow):
         try:
             self.btn_play.setEnabled(False)
             self.btn_track.setEnabled(False)
-            self.btn_track_realtime.setEnabled(False)
-            self.btn_pause_realtime.setEnabled(False)
             self.btn_autosegment.setEnabled(True)
             self.btn_stop.setEnabled(False)
         except Exception:
@@ -926,9 +1403,14 @@ class C_Elegans_GUI(QMainWindow):
         btn_import_h5.setFixedSize(200, 50)
         btn_import_h5.clicked.connect(self.choose_hdf5)
 
+        btn_convert_tif = QPushButton("Convert TIF Folder to HDF5")
+        btn_convert_tif.setFixedSize(220, 50)
+        btn_convert_tif.clicked.connect(self._open_tif_converter)
+
         layout.addWidget(label)
         layout.addWidget(btn_select, alignment=Qt.AlignCenter)
         layout.addWidget(btn_import_h5, alignment=Qt.AlignCenter)
+        layout.addWidget(btn_convert_tif, alignment=Qt.AlignCenter)
         self.selection_widget.setLayout(layout)
         self.stacked_widget.addWidget(self.selection_widget)
 
@@ -971,6 +1453,10 @@ class C_Elegans_GUI(QMainWindow):
         self.image_files = None
         self.h5_file_path = path
         self.h5_dataset_name = ds_name
+        
+        # Set parent directory for optional use as mask output
+        self.video_parent_dir = os.path.dirname(os.path.normpath(path))
+        self._update_parent_dir_label()
 
         # configure slider and UI
         self.slider.setMaximum(max(0, n_frames - 1))
@@ -1009,6 +1495,13 @@ class C_Elegans_GUI(QMainWindow):
                 self.start_spin.setValue(0)
         except Exception:
             pass
+
+    def _open_tif_converter(self):
+        if not H5PY_AVAILABLE:
+            QMessageBox.critical(self, "Error", "h5py is not installed. Please install h5py to use this feature.")
+            return
+        dlg = TifToH5Dialog(self)
+        dlg.exec_()
 
     def get_all_object_ids(self):
         """Get sorted list of all object IDs that exist across all frames."""
@@ -1231,24 +1724,6 @@ class C_Elegans_GUI(QMainWindow):
         end_row_layout.addStretch()
         self.left_layout.addWidget(end_row_widget)
 
-        # Stream mode row
-        stream_row_widget = QWidget()
-        stream_row_layout = QHBoxLayout()
-        stream_row_layout.setContentsMargins(0, 0, 0, 0)
-        stream_row_widget.setLayout(stream_row_layout)
-        self.stream_mode_checkbox = QCheckBox("Stream Mode")
-        self.stream_mode_checkbox.setChecked(False)
-        stream_row_layout.addWidget(self.stream_mode_checkbox)
-        stream_row_layout.addWidget(QLabel("Threshold:"))
-        self.stream_threshold_spin = QSpinBox()
-        self.stream_threshold_spin.setMinimum(1)
-        self.stream_threshold_spin.setMaximum(1000)
-        self.stream_threshold_spin.setValue(10)
-        self.stream_threshold_spin.setFixedWidth(60)
-        stream_row_layout.addWidget(self.stream_threshold_spin)
-        stream_row_layout.addStretch()
-        self.left_layout.addWidget(stream_row_widget)
-
         # Show centerlines checkbox
         centerline_checkbox_widget = QWidget()
         centerline_checkbox_layout = QHBoxLayout()
@@ -1298,13 +1773,15 @@ class C_Elegans_GUI(QMainWindow):
         prompt_size_row_layout.setContentsMargins(0, 0, 0, 0)
         prompt_size_row_widget.setLayout(prompt_size_row_layout)
         prompt_size_row_layout.addWidget(QLabel("Prompt Size:"))
-        self.prompt_size_spin = QSpinBox()
-        self.prompt_size_spin.setMinimum(1)
-        self.prompt_size_spin.setMaximum(50)
-        self.prompt_size_spin.setValue(5)
-        self.prompt_size_spin.setFixedWidth(60)
-        self.prompt_size_spin.valueChanged.connect(self._on_prompt_size_changed)
-        prompt_size_row_layout.addWidget(self.prompt_size_spin)
+        self.prompt_size_slider = QSlider(Qt.Horizontal)
+        self.prompt_size_slider.setMinimum(1)
+        self.prompt_size_slider.setMaximum(500)
+        self.prompt_size_slider.setValue(50)
+        self.prompt_size_slider.setFixedWidth(100)
+        self.prompt_size_value_label = QLabel("5.0")
+        self.prompt_size_slider.valueChanged.connect(self._on_prompt_size_changed)
+        prompt_size_row_layout.addWidget(self.prompt_size_slider)
+        prompt_size_row_layout.addWidget(self.prompt_size_value_label)
         prompt_size_row_layout.addStretch()
         self.left_layout.addWidget(prompt_size_row_widget)
 
@@ -1377,15 +1854,6 @@ class C_Elegans_GUI(QMainWindow):
         self.btn_track.clicked.connect(self.run_tracking)
         self.btn_track.setEnabled(False) # Disabled until autosegment is done
 
-        # Real-time tracking buttons
-        self.btn_track_realtime = QPushButton("Track in Real Time")
-        self.btn_track_realtime.clicked.connect(self.run_tracking_realtime)
-        self.btn_track_realtime.setEnabled(False)
-
-        self.btn_pause_realtime = QPushButton("Pause Tracking")
-        self.btn_pause_realtime.setEnabled(False)
-        self.btn_pause_realtime.clicked.connect(self.toggle_realtime_pause)
-
         self.btn_stop = QPushButton("Stop Tracking")
         self.btn_stop.setEnabled(False)
         self.btn_stop.clicked.connect(self.stop_tracking)
@@ -1394,8 +1862,6 @@ class C_Elegans_GUI(QMainWindow):
         self.left_layout.addSpacing(10)
         self.left_layout.addWidget(self.btn_autosegment)
         self.left_layout.addWidget(self.btn_track)
-        self.left_layout.addWidget(self.btn_track_realtime)
-        self.left_layout.addWidget(self.btn_pause_realtime)
         self.left_layout.addWidget(self.btn_stop)
 
         # Create vertical opacity slider
@@ -1465,22 +1931,34 @@ class C_Elegans_GUI(QMainWindow):
         self.btn_play.setEnabled(False)
         controls_layout.addWidget(self.btn_play)
 
-        # Model size selector
-        controls_layout.addWidget(QLabel("Model:"))
-        self.model_combo = QComboBox()
-        self.model_combo.addItems(["tiny", "base", "large"])
-        # default to 'base'
-        self.model_combo.setCurrentText("base")
-        self.model_combo.currentTextChanged.connect(lambda v: setattr(self, 'model_size', v))
-        controls_layout.addWidget(self.model_combo)
+        # Zoom controls
+        self.zoom_label = QLabel("1.0x")
+        controls_layout.addWidget(self.zoom_label)
+        self.zoom_slider = QSlider(Qt.Horizontal)
+        self.zoom_slider.setMinimum(0)       # 0  → 1.0x
+        self.zoom_slider.setMaximum(28)      # 28 → 8.0x  (steps of 0.25)
+        self.zoom_slider.setValue(0)
+        self.zoom_slider.setFixedWidth(120)
+        self.zoom_slider.setToolTip("Zoom level (1.0x – 8.0x)")
+        self.zoom_slider.valueChanged.connect(self._on_zoom_slider_changed)
+        controls_layout.addWidget(self.zoom_slider)
+        self.btn_reset_zoom = QPushButton("Reset Zoom")
+        self.btn_reset_zoom.setFixedSize(90, 24)
+        self.btn_reset_zoom.clicked.connect(self._reset_zoom)
+        controls_layout.addWidget(self.btn_reset_zoom)
+
+        # Checkpoint selector (model size derived automatically from filename)
+        self.model_size = DEFAULT_MODEL_SIZE
+        self.checkpoint_path = None
+        controls_layout.addWidget(QLabel("Checkpoint:"))
+        self.checkpoint_label = QLabel(DEFAULT_MODEL_SIZE)
+        self.checkpoint_label.setToolTip("No checkpoint selected — using default")
+        controls_layout.addWidget(self.checkpoint_label)
+        btn_checkpoint = QPushButton("Browse...")
+        btn_checkpoint.clicked.connect(self._choose_checkpoint)
+        controls_layout.addWidget(btn_checkpoint)
 
         layout.addLayout(controls_layout)
-
-        # btn_layout.addWidget(self.btn_autosegment)
-        # btn_layout.addWidget(self.btn_track)
-        # btn_layout.addWidget(self.btn_track_realtime)
-        # btn_layout.addWidget(self.btn_pause_realtime)
-        # layout.addLayout(btn_layout)
 
         # Status Bar / Progress
         self.status_label = QLabel("Ready")
@@ -1494,6 +1972,25 @@ class C_Elegans_GUI(QMainWindow):
         self.tracking_widget.setLayout(layout)
         self.stacked_widget.addWidget(self.tracking_widget)
 
+    def _choose_checkpoint(self):
+        path, _ = QFileDialog.getOpenFileName(self, "Select Checkpoint", "./checkpoints", "Checkpoint (*.pt)")
+        if not path:
+            return
+        name = os.path.basename(path).lower()
+        if 'tiny' in name:
+            size = 'tiny'
+        elif 'large' in name:
+            size = 'large'
+        elif 'base' in name or 'small' in name:
+            size = 'base'
+        else:
+            QMessageBox.warning(self, "Unknown checkpoint", f"Could not determine model size from '{os.path.basename(path)}'. Expected 'tiny', 'small'/'base', or 'large' in the filename.")
+            return
+        self.checkpoint_path = path
+        self.model_size = size
+        self.checkpoint_label.setText(os.path.basename(path))
+        self.checkpoint_label.setToolTip(path)
+
     def choose_folder(self):
         folder = QFileDialog.getExistingDirectory(self, "Select Video Directory")
         if folder:
@@ -1501,6 +1998,10 @@ class C_Elegans_GUI(QMainWindow):
             self._reset_state_for_new_video()
 
             self.video_path = folder
+            # Set parent directory for optional use as mask output
+            self.video_parent_dir = os.path.dirname(os.path.normpath(folder))
+            self._update_parent_dir_label()
+            
             # Load images
             files = [f for f in os.listdir(folder) if f.lower().endswith(('.jpg', '.png', '.jpeg'))]
             # Try to sort numerically if filenames are integers
@@ -1568,26 +2069,27 @@ class C_Elegans_GUI(QMainWindow):
         self.slider.setValue(value)
 
     def _on_mask_opacity_changed(self, value):
-        """Handle mask opacity slider changes."""
+        """Invalidate blended cache and re-blend from raw data with new opacity."""
         self.mask_opacity = value / 100.0
         self.mask_opacity_label.setText(f"{value}%")
-        # Clear pixmap cache so masks get redrawn with new opacity
-        self.clear_pixmap_cache()
-        # Request reload of current frame to show new opacity immediately
+        # Clear blended composites — they were made with the old opacity
         try:
-            self._image_loader.request(self.current_frame_idx)
+            self._blended_cache.clear()
         except Exception:
-            pass
+            self._blended_cache = OrderedDict()
+        self.clear_pixmap_cache()
+        # Re-blend current frame from raw cache
+        idx = self.current_frame_idx
+        if idx in self._raw_frame_cache:
+            img_rgb, mask_rgb = self._raw_frame_cache[idx]
+            self._on_frame_loaded(idx, img_rgb, mask_rgb)
+        else:
+            self._image_loader.request(idx)
 
     def _on_show_centerlines_changed(self, state):
         """Handle show centerlines checkbox changes."""
-        # Clear pixmap cache so centerlines get redrawn/hidden
         self.clear_pixmap_cache()
-        # Request reload of current frame
-        try:
-            self._image_loader.request(self.current_frame_idx)
-        except Exception:
-            pass
+        self._render_current_frame_sync()
 
     def _on_centerline_points_changed(self, value):
         """Handle centerline points spinbox changes - resample and redraw."""
@@ -1609,11 +2111,18 @@ class C_Elegans_GUI(QMainWindow):
                         updated_centerlines[obj_id] = centerline_data
                 self.centerlines[frame_idx] = updated_centerlines
             
-            # Clear cache and reload current frame
+            # Clear cache and reload current frame from raw cache if available
             self.clear_pixmap_cache()
-            self._image_loader.request(self.current_frame_idx)
+            self._render_current_frame_sync()
         except Exception:
             pass
+
+    def _on_prompt_size_changed(self, value):
+        """Handle prompt point size slider changes - redraw prompts."""
+        self.prompt_point_size = value / 10.0
+        self.prompt_size_value_label.setText(f"{self.prompt_point_size:.1f}")
+        self.clear_pixmap_cache()
+        self._render_current_frame_sync()
 
     def _resample_centerline(self, centerline, num_points):
         """Resample centerline to desired number of points (same logic as TrackerWorker)."""
@@ -1633,6 +2142,128 @@ class C_Elegans_GUI(QMainWindow):
         except Exception:
             self.pixmap_cache = {}
 
+    def _render_current_frame_sync(self):
+        """Re-render the current frame on the GUI thread — zero blend work on zoom/pan.
+        Reads the pre-blended composite from _blended_cache if available,
+        otherwise falls back to raw data (re-blends) or the background loader.
+        """
+        idx = self.current_frame_idx
+        self.pixmap_cache.pop(idx, None)
+        if idx in self._blended_cache:
+            # Fast path: composite already blended, just crop+resize+draw overlays
+            blended = self._blended_cache[idx]
+            mask_rgb = self._raw_frame_cache.get(idx, (None, None))[1] if idx in self._raw_frame_cache else None
+            self._on_frame_loaded(idx, blended, None)  # mask_rgb=None skips re-blend
+        elif idx in self._raw_frame_cache:
+            img_rgb, mask_rgb = self._raw_frame_cache[idx]
+            self._on_frame_loaded(idx, img_rgb, mask_rgb)
+        else:
+            self._image_loader.request(idx)
+
+    # ------------------------------------------------------------------
+    # Zoom / pan helpers
+    # ------------------------------------------------------------------
+
+    def _clamp_pan_offset(self, orig_w: int, orig_h: int) -> None:
+        """Clamp pan_offset so the viewport stays within image bounds."""
+        label_w = self.image_label.width()
+        label_h = self.image_label.height()
+        if label_w <= 0 or label_h <= 0:
+            return
+        base_scale = min(label_w / orig_w, label_h / orig_h)
+        viewport_w = label_w / (base_scale * self.zoom_level)
+        viewport_h = label_h / (base_scale * self.zoom_level)
+        x0 = max(0.0, min(self.pan_offset[0], orig_w - viewport_w))
+        y0 = max(0.0, min(self.pan_offset[1], orig_h - viewport_h))
+        self.pan_offset = (x0, y0)
+
+    def _apply_zoom_step(self, delta: float, cursor_pos=None) -> None:
+        """Increase or decrease zoom_level by delta, clamp, update pan_offset to keep
+        cursor_pos fixed in image space, invalidate cache, and re-render."""
+        new_zoom = round(self.zoom_level + delta, 10)  # avoid float drift
+        # clamp to [1.0, 8.0]
+        new_zoom = max(1.0, min(8.0, new_zoom))
+        # round to nearest 0.25
+        new_zoom = round(new_zoom / 0.25) * 0.25
+
+        # Determine original image dimensions
+        orig_w, orig_h = None, None
+        if hasattr(self, '_last_loaded_rgb') and self._last_loaded_rgb is not None:
+            orig_h, orig_w = self._last_loaded_rgb.shape[0], self._last_loaded_rgb.shape[1]
+
+        if cursor_pos is not None and orig_w is not None:
+            label_w = self.image_label.width()
+            label_h = self.image_label.height()
+            if label_w > 0 and label_h > 0:
+                img_pt = CoordinateMapper.display_to_image(
+                    cursor_pos.x(), cursor_pos.y(),
+                    label_w, label_h,
+                    orig_w, orig_h,
+                    self.zoom_level, self.pan_offset,
+                )
+                cursor_frac_x = cursor_pos.x() / label_w
+                cursor_frac_y = cursor_pos.y() / label_h
+                new_pan_x = img_pt[0] - cursor_frac_x * (orig_w / new_zoom)
+                new_pan_y = img_pt[1] - cursor_frac_y * (orig_h / new_zoom)
+                self.pan_offset = (new_pan_x, new_pan_y)
+
+        self.zoom_level = new_zoom
+
+        if self.zoom_level == 1.0:
+            self.pan_offset = (0.0, 0.0)
+        elif orig_w is not None:
+            self._clamp_pan_offset(orig_w, orig_h)
+
+        # Invalidate pixmap cache for current frame
+        try:
+            if self.current_frame_idx in self.pixmap_cache:
+                del self.pixmap_cache[self.current_frame_idx]
+        except Exception:
+            pass
+
+        # Update zoom label if present
+        if hasattr(self, 'zoom_label'):
+            self.zoom_label.setText(f"{self.zoom_level:.1f}x")
+        # Sync zoom slider without triggering its valueChanged signal
+        if hasattr(self, 'zoom_slider'):
+            self.zoom_slider.blockSignals(True)
+            self.zoom_slider.setValue(round((self.zoom_level - 1.0) / 0.25))
+            self.zoom_slider.blockSignals(False)
+
+        # Re-render synchronously from cached raw data — no thread hop needed
+        self._render_current_frame_sync()
+
+    def _reset_zoom(self) -> None:
+        """Set zoom_level = 1.0, pan_offset = (0, 0), invalidate cache, re-render."""
+        self.zoom_level = 1.0
+        self.pan_offset = (0.0, 0.0)
+
+        # Invalidate pixmap cache for current frame
+        try:
+            if self.current_frame_idx in self.pixmap_cache:
+                del self.pixmap_cache[self.current_frame_idx]
+        except Exception:
+            pass
+
+        # Update zoom label if present
+        if hasattr(self, 'zoom_label'):
+            self.zoom_label.setText(f"{self.zoom_level:.1f}x")
+        # Sync zoom slider
+        if hasattr(self, 'zoom_slider'):
+            self.zoom_slider.blockSignals(True)
+            self.zoom_slider.setValue(0)
+            self.zoom_slider.blockSignals(False)
+
+        # Re-render synchronously from cached raw data
+        self._render_current_frame_sync()
+
+    def _on_zoom_slider_changed(self, value: int) -> None:
+        """Called when the zoom slider is moved. value is 0–28, maps to 1.0–8.0x."""
+        target_zoom = 1.0 + value * 0.25
+        delta = target_zoom - self.zoom_level
+        if abs(delta) > 1e-9:
+            self._apply_zoom_step(delta)
+
     def run_autosegmentation(self):
         if not self.image_files:
             return
@@ -1648,11 +2279,13 @@ class C_Elegans_GUI(QMainWindow):
         # Run user's logic
         try:
             prompts = process_image_and_scale_centers(img, downsample_resolution=8, num_skeleton_points=10)
+            
             # store prompts as separate objects (one per detected worm)
             # wrap each coordinate as ((x, y), 1) for positive prompts
             for i, skeleton_pts in enumerate(prompts):
                 labeled_prompts = [((x, y), 1) for x, y in skeleton_pts]
                 self.create_new_object(target_idx, labeled_prompts)
+            
             # mark which frame these prompts belong to
             self.autoseg_frame_idx = target_idx
 
@@ -1677,8 +2310,8 @@ class C_Elegans_GUI(QMainWindow):
             try:
                 # draw on a copy (BGR) so we can show markers immediately without waiting for the loader
                 img_bgr = img.copy()
-                circle_radius = 15
-                x_size = 18
+                circle_radius = max(1, int(round(self.prompt_point_size)))
+                x_size = max(1, int(round(self.prompt_point_size * 1.2)))
                 # bright red in BGR for selection highlight
                 gold_bgr = (0, 0, 255)
                 text_bgr = (255, 255, 255)
@@ -1778,63 +2411,36 @@ class C_Elegans_GUI(QMainWindow):
             self.status_label.setText("Error in segmentation.")
 
     def run_tracking(self):
+        if LOGGING:
+            print("------- Running Tracking... -------")
+
         if not SAM2_AVAILABLE:
             QMessageBox.critical(self, "Error", "SAM 2 library is not installed/importable.")
             return
 
-        # If dataset was loaded from HDF5, export frames to a temporary folder first
-        if getattr(self, 'h5_file_path', None) is not None:
-            # check that prompts exist for requested start frame before exporting
-            try:
-                start_frame = int(self.start_spin.value()) if hasattr(self, 'start_spin') else 0
-            except Exception:
-                start_frame = 0
-            # Check if any object has prompts in the start frame
-            start_frame_has_prompts = any(
-                len(self.get_prompts_for_object_in_frame(obj_id, start_frame)) > 0 
-                for obj_id in self.get_all_object_ids()
-            )
-            if not start_frame_has_prompts:
-                QMessageBox.critical(self, "Error", "No prompts for chosen start frame. Please add some prompts.")
-                return
-            
-            try:
-                end_frame = int(self.end_spin.value()) if hasattr(self, 'end_spin') else None
-            except Exception:
-                end_frame = None
-            
-
-            # start export worker
-            try:
-                self.btn_track.setEnabled(False)
-                self.btn_autosegment.setEnabled(False)
-                self.status_label.setText("Exporting HDF5 frames to temporary folder...")
-                self._export_worker = ExportH5Worker(self.h5_file_path, start_frame, end_frame, getattr(self, 'h5_dataset_name', None))
-                self._export_worker.stream_mode = self.stream_mode_checkbox.isChecked()
-                self._export_worker.stream_threshold = self.stream_threshold_spin.value()
-                # show progress
-                self._export_worker.progress.connect(lambda p: self.status_label.setText(f"Exporting frames... {p}%"))
-                # when stream ready, start tracker (but keep exporting remaining frames)
-                self._export_worker.ready.connect(self._on_h5_export_ready)
-                # when finished, still call on_tracking_finished so masks can be indexed
-                # self._export_worker.finished.connect(self.on_tracking_finished)
-                self._export_worker.error.connect(self.on_tracking_error)
-                self._export_worker.start()
-                return
-            except Exception as e:
-                QMessageBox.critical(self, "Error", f"Failed to start HDF5 export: {e}")
-                return
-
-        # determine requested frame range from spinboxes (if present)
+        # check that prompts exist for requested start frame before exporting
         try:
             start_frame = int(self.start_spin.value()) if hasattr(self, 'start_spin') else 0
-            end_frame = int(self.end_spin.value()) if hasattr(self, 'end_spin') else None
-        except Exception:
+        except Exception as e:
+            print(f"Error reading start frame: {e}, setting start_frame to 0")
             start_frame = 0
+            
+        # Check if any object has prompts in the start frame
+        start_frame_has_prompts = any(
+            len(self.get_prompts_for_object_in_frame(obj_id, start_frame)) > 0 
+            for obj_id in self.get_all_object_ids()
+        )
+        if not start_frame_has_prompts:
+            QMessageBox.critical(self, "Error", "No prompts for chosen start frame. Please add some prompts.")
+            return
+        
+        try:
+            end_frame = int(self.end_spin.value()) if hasattr(self, 'end_spin') else None
+        except Exception as e:
+            print(f"Error reading end frame: {e}, setting end_frame to None")
             end_frame = None
 
-        # normal folder-based tracking
-        self._start_tracker_worker(self.video_path, start_frame=start_frame, end_frame=end_frame)
+        self._start_tracker_worker(start_frame=start_frame, end_frame=end_frame)
 
     def stop_tracking(self):
         """Request an early stop for ongoing tracking."""
@@ -1842,11 +2448,6 @@ class C_Elegans_GUI(QMainWindow):
             if hasattr(self, 'worker') and self.worker is not None and self.worker.isRunning():
                 self.worker.request_stop()
                 self.status_label.setText("Stop requested... finishing current frame.")
-            if hasattr(self, '_realtime_worker') and getattr(self, '_realtime_worker', None) is not None:
-                try:
-                    self._realtime_worker.stop()
-                except Exception:
-                    pass
             try:
                 self.btn_stop.setEnabled(False)
             except Exception:
@@ -1854,103 +2455,13 @@ class C_Elegans_GUI(QMainWindow):
         except Exception:
             pass
 
-    def run_tracking_realtime(self):
-        """Start real-time tracking: export HDF5 if needed, otherwise start realtime worker on folder."""
-        if not SAM2_AVAILABLE:
-            QMessageBox.critical(self, "Error", "SAM 2 library is not installed/importable.")
-            return
-
-        # if HDF5 source, export first
-        if getattr(self, 'h5_file_path', None) is not None:
-            # check that prompts exist for requested start frame before exporting
-            try:
-                start_frame = int(self.start_spin.value()) if hasattr(self, 'start_spin') else 0
-            except Exception:
-                start_frame = 0
-            start_frame_has_prompts = any(
-                len(self.get_prompts_for_object_in_frame(obj_id, start_frame)) > 0 
-                for obj_id in self.get_all_object_ids()
-            )
-            if not start_frame_has_prompts:
-                QMessageBox.critical(self, "Error", "No prompts for chosen start frame. Please add some prompts.")
-                return
-            try:
-                self.btn_track_realtime.setEnabled(False)
-                self.btn_autosegment.setEnabled(False)
-                self.status_label.setText("Exporting HDF5 frames to temporary folder for real-time tracking...")
-                self._export_worker = ExportH5Worker(self.h5_file_path, getattr(self, 'h5_dataset_name', None))
-                self._export_worker.stream_mode = False
-                self._export_worker.progress.connect(lambda p: self.status_label.setText(f"Exporting frames... {p}%"))
-                self._export_worker.ready.connect(self._on_h5_export_finished_realtime)
-                self._export_worker.finished.connect(self.on_tracking_finished)
-                self._export_worker.error.connect(self.on_tracking_error)
-                self._export_worker.start()
-                return
-            except Exception as e:
-                QMessageBox.critical(self, "Error", f"Failed to start HDF5 export: {e}")
-                return
-
-        # determine requested frame range from spinboxes (if present)
-        try:
-            start_frame = int(self.start_spin.value()) if hasattr(self, 'start_spin') else 0
-            end_frame = int(self.end_spin.value()) if hasattr(self, 'end_spin') else None
-        except Exception:
-            start_frame = 0
-            end_frame = None
-
-        # start realtime on folder
-        self._start_realtime_worker(self.video_path, start_frame=start_frame, end_frame=end_frame)
-
-    def _on_h5_export_finished_realtime(self, temp_folder):
-        # save export tempdir so cleanup happens later
-        self._h5_export_tempdir = temp_folder
-        # get requested start/end
-        try:
-            start_frame = int(self.start_spin.value()) if hasattr(self, 'start_spin') else 0
-            end_frame = int(self.end_spin.value()) if hasattr(self, 'end_spin') else None
-        except Exception:
-            start_frame = 0
-            end_frame = None
-        self._start_realtime_worker(temp_folder, start_frame=start_frame, end_frame=end_frame)
-
-    def _start_realtime_worker(self, video_folder, start_frame=0, end_frame=None):
-        try:
-            self.btn_track_realtime.setEnabled(False)
-            self.btn_pause_realtime.setEnabled(True)
-            self.btn_track.setEnabled(False)
-            self.btn_autosegment.setEnabled(False)
-            self.status_label.setText("Real-time tracking...")
-            # fetch prompts for the requested start frame for all objects
-            prompts = self.get_prompts_for_frame(start_frame)
-            if not any(prompts):  # Check if any object has prompts
-                QMessageBox.critical(self, "Error", "No prompts for chosen start frame. Please add some prompts.")
-                # re-enable UI
-                self.btn_track_realtime.setEnabled(True)
-                self.btn_pause_realtime.setEnabled(False)
-                self.btn_autosegment.setEnabled(True)
-                return
-
-            self._realtime_worker = RealTimeTrackerWorker(video_folder, self.device, prompts, colors=self.colors, model_size=getattr(self, 'model_size', 'base'), start_frame=start_frame, end_frame=end_frame)
-            self._realtime_worker.frameMask.connect(self._on_realtime_frame)
-            self._realtime_worker.finished.connect(self.on_tracking_finished)
-            self._realtime_worker.error.connect(self.on_tracking_error)
-            self._realtime_worker.start()
-            try:
-                self.btn_stop.setEnabled(True)
-            except Exception:
-                pass
-        except Exception as e:
-            QMessageBox.critical(self, "Error", f"Failed to start realtime tracker: {e}")
-            self.btn_track_realtime.setEnabled(True)
-            self.btn_pause_realtime.setEnabled(False)
-            self.btn_autosegment.setEnabled(True)
-
-    def _start_tracker_worker(self, video_folder, start_frame=0, end_frame=None):
+    def _start_tracker_worker(self, start_frame, end_frame):
         """Start the TrackerWorker using the given video_folder path."""
         try:
             self.btn_track.setEnabled(False)
             self.btn_autosegment.setEnabled(False)
             self.status_label.setText("Tracking in progress... This may take a moment.")
+            print("------------------------------")
             print(f"Starting tracker for frames {start_frame} to {end_frame}")
             # fetch prompts for all objects in the requested start frame
             prompts = self.get_prompts_for_frame(start_frame)
@@ -1961,25 +2472,44 @@ class C_Elegans_GUI(QMainWindow):
                 return
 
             video_name = getattr(self, 'h5_file_path', None) or self.video_path
-            print(f"Video name for tracker: {video_name}")
-            print(f"trackerworker video folder: {video_folder}")
-            print(f"trackerworker frame range: {start_frame} to {end_frame}")
+            
+            # Determine which mask output directory to use
+            mask_output_dir = self.save_mask_dir
+            if self.use_parent_dir_for_masks and self.video_parent_dir:
+                mask_output_dir = self.video_parent_dir
+                print(f"Using parent directory for masks: {mask_output_dir}")
+            
+            print(f"h5 file path: {getattr(self, 'h5_file_path', None)}")
+            # Start tracker worker
             self.worker = TrackerWorker(
-                video_folder,
+                getattr(self, 'h5_file_path', None) or self.video_path,
                 self.device,
                 prompts,
                 colors=self.colors,
-                model_size=getattr(self, 'model_size', 'base'),
+                model_size=self.model_size,
+                checkpoint_path=getattr(self, 'checkpoint_path', None),
                 start_frame=start_frame,
                 end_frame=end_frame,
                 video_name=video_name,
                 num_centerline_points=self.centerline_points_spin.value(),
-                save_mask_dir=self.save_mask_dir,
+                save_mask_dir=mask_output_dir,
+                batch_size=self.batch_size_spin.value(),
+                kernel_size=self.kernel_size,
+                kernel_iterations=self.kernel_iterations,
+                num_positive_prompts=self.num_positive_prompts,
+                negative_kernel_size=self.negative_kernel_size,
+                negative_kernel_iterations=self.negative_kernel_iterations,
+                num_negative_prompts=self.num_negative_prompts,
             )
+            print("connecting maskSaved signal")
             self.worker.maskSaved.connect(self._on_mask_saved)
+            print("connecting centerlineComputed signal")
             self.worker.centerlineComputed.connect(self._on_centerline_computed)
+            print("connecting finished signal")
             self.worker.finished.connect(self.on_tracking_finished)
+            print("connecting error signal")
             self.worker.error.connect(self.on_tracking_error)
+            print("starting worker thread")
             self.worker.start()
             try:
                 self.btn_stop.setEnabled(True)
@@ -1991,12 +2521,12 @@ class C_Elegans_GUI(QMainWindow):
             self.btn_autosegment.setEnabled(True)
 
     def _prefetch_neighbors(self, idx):
-        # Request loading of current frame and neighbors
+        # Prefetch neighboring frames (low priority — current frame always wins)
         start = max(0, idx - self.prefetch_radius)
         end = min(self.slider.maximum(), idx + self.prefetch_radius)
         for i in range(start, end + 1):
-            if i not in self.pixmap_cache:
-                self._image_loader.request(i)
+            if i not in self.pixmap_cache and i != idx:
+                self._image_loader.request(i, priority=False)
 
     def choose_mask_output_dir(self):
         folder = QFileDialog.getExistingDirectory(self, "Select Mask Output Directory", self.save_mask_dir)
@@ -2011,134 +2541,324 @@ class C_Elegans_GUI(QMainWindow):
             except Exception:
                 pass
 
-    def _on_frame_loaded(self, idx, img_rgb):
-        # Called in GUI thread when image loader has RGB numpy image ready
+    def _update_parent_dir_label(self):
+        """Update the parent directory label when a video is loaded."""
+        if self.video_parent_dir:
+            parent_dir_name = os.path.basename(self.video_parent_dir)
+            self.parent_dir_label_text.setText(f"use parent dir: {parent_dir_name}")
+        else:
+            self.parent_dir_label_text.setText("use parent dir: (no video loaded)")
+
+    def _on_use_parent_dir_changed(self, state):
+        """Handle checkbox state changes for using parent directory."""
+        self.use_parent_dir_for_masks = (state == Qt.Checked)
+
+    def _on_frame_loaded(self, idx, img_rgb, mask_rgb=None):
+        # Called in GUI thread. Stores raw data, blends once into _blended_cache,
+        # then renders. Zoom/pan re-renders read from _blended_cache — no blend work.
         try:
             img_rgb = np.ascontiguousarray(img_rgb)
-            # keep a copy of the full-resolution RGB for coordinate mapping (when showing current frame)
+
+            # Store raw (img, mask) — source of truth for opacity changes
+            try:
+                if len(self._raw_frame_cache) >= self._raw_frame_cache_max:
+                    self._raw_frame_cache.popitem(last=False)
+                self._raw_frame_cache[idx] = (img_rgb, mask_rgb)
+                self._raw_frame_cache.move_to_end(idx, last=True)
+            except Exception:
+                self._raw_frame_cache[idx] = (img_rgb, mask_rgb)
+
+            # Blend once and cache the result — zoom/pan will reuse this directly
+            if mask_rgb is not None:
+                opacity = getattr(self, 'mask_opacity', 0.5)
+                mask_indices = np.any(mask_rgb != [0, 0, 0], axis=-1)
+                blended = img_rgb.copy()
+                blended[mask_indices] = (
+                    img_rgb[mask_indices] * (1.0 - opacity) +
+                    mask_rgb[mask_indices] * opacity
+                ).astype(np.uint8)
+                blended = np.ascontiguousarray(blended)
+            else:
+                blended = img_rgb  # no copy needed — read-only from here
+
+            try:
+                if len(self._blended_cache) >= self._blended_cache_max:
+                    self._blended_cache.popitem(last=False)
+                self._blended_cache[idx] = blended
+                self._blended_cache.move_to_end(idx, last=True)
+            except Exception:
+                self._blended_cache[idx] = blended
+
+            # Use the blended composite for all rendering below
+            img_rgb = blended
+
+            # keep a copy of the full-resolution RGB for coordinate mapping
             if idx == self.current_frame_idx:
                 try:
                     self._last_loaded_rgb = img_rgb.copy()
                 except Exception:
                     self._last_loaded_rgb = None
-            h, w, ch = img_rgb.shape
-            bytes_per_line = ch * w
-            q_img = QImage(img_rgb.data, w, h, bytes_per_line, QImage.Format_RGB888)
 
-            # Draw prompt markers for any frame that has prompts
-            all_obj_ids = self.get_all_object_ids()
-            has_prompts = any(len(self.get_prompts_for_object_in_frame(obj_id, idx)) > 0 for obj_id in all_obj_ids)
-            
-            if has_prompts:
-                # Draw filled circles for positive and X markers for negative prompts
-                # Convert RGB->BGR for OpenCV drawing, then back to RGB
-                img_bgr = cv2.cvtColor(img_rgb, cv2.COLOR_RGB2BGR)
-                circle_radius = 15
-                x_size = 18
-                # bright red in BGR for selection highlight
-                gold_bgr = (0, 0, 255)
-                text_bgr = (255, 255, 255)
-                outline_bgr = (0, 0, 0)
+            if self._last_loaded_rgb is None and idx == self.current_frame_idx:
+                return
 
-                for obj_id in all_obj_ids:
-                    skeleton_pts = self.get_prompts_for_object_in_frame(obj_id, idx)
-                    if not skeleton_pts:
-                        continue
-                    try:
-                        is_selected = (self.selected_object_idx is not None and self.selected_object_idx == obj_id)
-                        color_rgb = tuple(map(int, self.colors[(obj_id + 1) % len(self.colors)]))
-                        color_bgr = (int(color_rgb[2]), int(color_rgb[1]), int(color_rgb[0]))
-                        for ((cx, cy), label) in skeleton_pts:
-                            cx_i = int(cx)
-                            cy_i = int(cy)
-                            
-                            if label == 1:
-                                # Positive prompt: draw circle
-                                if is_selected:
-                                    # draw red outer ring then inner filled color to emphasize selection
-                                    sel_radius = circle_radius + 12
-                                    inner_radius = circle_radius + 4
-                                    cv2.circle(img_bgr, (cx_i, cy_i), sel_radius, gold_bgr, -1)
-                                    cv2.circle(img_bgr, (cx_i, cy_i), inner_radius, color_bgr, -1)
-                                    cv2.circle(img_bgr, (cx_i, cy_i), inner_radius, outline_bgr, 4)
-                                    try:
-                                        cv2.putText(img_bgr, str(obj_id+1), (cx_i+inner_radius+2, cy_i-inner_radius-2), cv2.FONT_HERSHEY_SIMPLEX, 0.7, text_bgr, 3, cv2.LINE_AA)
-                                    except Exception:
-                                        pass
-                                else:
-                                    cv2.circle(img_bgr, (cx_i, cy_i), circle_radius, color_bgr, -1)
-                                    cv2.circle(img_bgr, (cx_i, cy_i), circle_radius, outline_bgr, 1)
-                                    try:
-                                        cv2.putText(img_bgr, str(obj_id+1), (cx_i+8, cy_i-8), cv2.FONT_HERSHEY_SIMPLEX, 0.5, text_bgr, 1, cv2.LINE_AA)
-                                    except Exception:
-                                        pass
-                            else:
-                                # Negative prompt: draw X
-                                if is_selected:
-                                    # draw thick X with gold outline
-                                    x_half = x_size + 8
-                                    cv2.line(img_bgr, (cx_i - x_half, cy_i - x_half), (cx_i + x_half, cy_i + x_half), gold_bgr, 8)
-                                    cv2.line(img_bgr, (cx_i - x_half, cy_i + x_half), (cx_i + x_half, cy_i - x_half), gold_bgr, 8)
-                                    cv2.line(img_bgr, (cx_i - x_half + 4, cy_i - x_half + 4), (cx_i + x_half - 4, cy_i + x_half - 4), color_bgr, 6)
-                                    cv2.line(img_bgr, (cx_i - x_half + 4, cy_i + x_half - 4), (cx_i + x_half - 4, cy_i - x_half + 4), color_bgr, 6)
-                                    try:
-                                        cv2.putText(img_bgr, str(obj_id+1), (cx_i+x_half+2, cy_i-x_half-2), cv2.FONT_HERSHEY_SIMPLEX, 0.7, text_bgr, 3, cv2.LINE_AA)
-                                    except Exception:
-                                        pass
-                                else:
-                                    x_half = x_size // 2
-                                    cv2.line(img_bgr, (cx_i - x_half, cy_i - x_half), (cx_i + x_half, cy_i + x_half), color_bgr, 4)
-                                    cv2.line(img_bgr, (cx_i - x_half, cy_i + x_half), (cx_i + x_half, cy_i - x_half), color_bgr, 4)
-                                    cv2.line(img_bgr, (cx_i - x_half, cy_i - x_half), (cx_i + x_half, cy_i + x_half), outline_bgr, 1)
-                                    cv2.line(img_bgr, (cx_i - x_half, cy_i + x_half), (cx_i + x_half, cy_i - x_half), outline_bgr, 1)
-                                    try:
-                                        cv2.putText(img_bgr, str(obj_id+1), (cx_i+x_half+2, cy_i-x_half-2), cv2.FONT_HERSHEY_SIMPLEX, 0.5, text_bgr, 1, cv2.LINE_AA)
-                                    except Exception:
-                                        pass
-                    except Exception:
-                        continue
-                # convert back to RGB for Qt
-                img_rgb = cv2.cvtColor(img_bgr, cv2.COLOR_BGR2RGB)
-                img_rgb = np.ascontiguousarray(img_rgb)
-                q_img = QImage(img_rgb.data, w, h, bytes_per_line, QImage.Format_RGB888)
-            
-            # Draw centerlines if available for this frame and checkbox is checked
-            show_centerlines = getattr(self, 'show_centerlines_checkbox', None)
-            if idx in self.centerlines and show_centerlines and show_centerlines.isChecked():
-                # Convert back to BGR for OpenCV drawing
-                img_bgr = cv2.cvtColor(img_rgb, cv2.COLOR_RGB2BGR)
-                centerline_dict = self.centerlines[idx]
-                pink_bgr = (255, 192, 203)  # Pink in BGR
-                red_bgr = (0, 0, 255)  # Red in BGR
-                for obj_id, centerline_data in centerline_dict.items():
-                    # centerline_data is (full_skeleton, resampled_points)
-                    if isinstance(centerline_data, tuple) and len(centerline_data) == 2:
-                        full_skeleton, resampled_points = centerline_data
-                    else:
-                        # Backward compatibility: if it's just a list, treat as resampled
-                        full_skeleton = centerline_data if centerline_data else []
-                        resampled_points = centerline_data if centerline_data else []
-                    
-                    # Draw full skeleton as pink circles (small)
-                    for pt in full_skeleton:
+            orig_h, orig_w = img_rgb.shape[0], img_rgb.shape[1]
+
+            # --- Zoom-aware rendering branch ---
+            zoom_level = getattr(self, 'zoom_level', 1.0)
+            pan_offset = getattr(self, 'pan_offset', (0.0, 0.0))
+            label_w = self.image_label.width()
+            label_h = self.image_label.height()
+
+            if zoom_level > 1.0 and label_w > 0 and label_h > 0:
+                # Crop the viewport region from the full-resolution image
+                x0, y0, x1, y1 = CoordinateMapper.viewport_crop(
+                    label_w, label_h, orig_w, orig_h, zoom_level, pan_offset
+                )
+                crop = img_rgb[y0:y1, x0:x1]
+                # Scale the crop to fill the label exactly
+                display_rgb = cv2.resize(crop, (label_w, label_h), interpolation=cv2.INTER_LINEAR)
+                display_rgb = np.ascontiguousarray(display_rgb)
+
+                # Draw centerlines on the display image using display coordinates
+                show_centerlines = getattr(self, 'show_centerlines_checkbox', None)
+                if idx in self.centerlines and show_centerlines and show_centerlines.isChecked():
+                    display_bgr = cv2.cvtColor(display_rgb, cv2.COLOR_RGB2BGR)
+                    centerline_dict = self.centerlines[idx]
+                    pink_bgr = (255, 192, 203)
+                    red_bgr = (0, 0, 255)
+                    for obj_id, centerline_data in centerline_dict.items():
+                        if isinstance(centerline_data, tuple) and len(centerline_data) == 2:
+                            full_skeleton, resampled_points = centerline_data
+                        else:
+                            full_skeleton = centerline_data if centerline_data else []
+                            resampled_points = centerline_data if centerline_data else []
+                        # Batch-transform all skeleton points at once
+                        base_scale = min(label_w / orig_w, label_h / orig_h)
+                        disp_scale = base_scale * zoom_level
+                        if full_skeleton:
+                            try:
+                                pts = np.array(full_skeleton, dtype=np.float32)
+                                dxs = (pts[:, 0] - pan_offset[0]) * disp_scale
+                                dys = (pts[:, 1] - pan_offset[1]) * disp_scale
+                                visible = (dxs >= 0) & (dxs < label_w) & (dys >= 0) & (dys < label_h)
+                                vis_pts = np.stack([dxs[visible], dys[visible]], axis=1).astype(np.int32)
+                                if len(vis_pts) >= 2:
+                                    cv2.polylines(display_bgr, [vis_pts.reshape(-1, 1, 2)], False, pink_bgr, 1)
+                                elif len(vis_pts) == 1:
+                                    cv2.circle(display_bgr, tuple(vis_pts[0]), 1, pink_bgr, -1)
+                            except Exception:
+                                pass
+                        if resampled_points:
+                            try:
+                                pts = np.array(resampled_points, dtype=np.float32)
+                                dxs = (pts[:, 0] - pan_offset[0]) * disp_scale
+                                dys = (pts[:, 1] - pan_offset[1]) * disp_scale
+                                visible = (dxs >= 0) & (dxs < label_w) & (dys >= 0) & (dys < label_h)
+                                for px, py in zip(dxs[visible].astype(int), dys[visible].astype(int)):
+                                    cv2.circle(display_bgr, (px, py), 3, red_bgr, -1)
+                            except Exception:
+                                pass
+                    display_rgb = cv2.cvtColor(display_bgr, cv2.COLOR_BGR2RGB)
+                    display_rgb = np.ascontiguousarray(display_rgb)
+
+                # Draw prompt markers on the display image using display coordinates
+                all_obj_ids = self.get_all_object_ids()
+                has_prompts = any(len(self.get_prompts_for_object_in_frame(obj_id, idx)) > 0 for obj_id in all_obj_ids)
+                if has_prompts:
+                    display_bgr = cv2.cvtColor(display_rgb, cv2.COLOR_RGB2BGR)
+                    base_radius = max(1, int(round(self.prompt_point_size)))
+                    circle_radius = min(int(base_radius * zoom_level), 20)
+                    x_size = min(int(base_radius * zoom_level * 1.2), 24)
+                    gold_bgr = (0, 0, 255)
+                    text_bgr = (255, 255, 255)
+                    outline_bgr = (0, 0, 0)
+
+                    for obj_id in all_obj_ids:
+                        skeleton_pts = self.get_prompts_for_object_in_frame(obj_id, idx)
+                        if not skeleton_pts:
+                            continue
                         try:
-                            cv2.circle(img_bgr, pt, 1, pink_bgr, -1)
+                            is_selected = (self.selected_object_idx is not None and self.selected_object_idx == obj_id)
+                            color_rgb = tuple(map(int, self.colors[(obj_id + 1) % len(self.colors)]))
+                            color_bgr = (int(color_rgb[2]), int(color_rgb[1]), int(color_rgb[0]))
+                            for ((cx, cy), label) in skeleton_pts:
+                                # Convert image coords to display coords
+                                try:
+                                    dx, dy = CoordinateMapper.image_to_display(
+                                        cx, cy, label_w, label_h, orig_w, orig_h, zoom_level, pan_offset)
+                                except Exception:
+                                    continue
+                                # Skip points outside the visible viewport
+                                if not (0 <= dx < label_w and 0 <= dy < label_h):
+                                    continue
+                                cx_i, cy_i = int(dx), int(dy)
+
+                                if label == 1:
+                                    if is_selected:
+                                        sel_radius = circle_radius + 12
+                                        inner_radius = circle_radius + 4
+                                        cv2.circle(display_bgr, (cx_i, cy_i), sel_radius, gold_bgr, -1)
+                                        cv2.circle(display_bgr, (cx_i, cy_i), inner_radius, color_bgr, -1)
+                                        cv2.circle(display_bgr, (cx_i, cy_i), inner_radius, outline_bgr, 4)
+                                        try:
+                                            cv2.putText(display_bgr, str(obj_id+1), (cx_i+inner_radius+2, cy_i-inner_radius-2), cv2.FONT_HERSHEY_SIMPLEX, 0.7, text_bgr, 3, cv2.LINE_AA)
+                                        except Exception:
+                                            pass
+                                    else:
+                                        cv2.circle(display_bgr, (cx_i, cy_i), circle_radius, color_bgr, -1)
+                                        cv2.circle(display_bgr, (cx_i, cy_i), circle_radius, outline_bgr, 1)
+                                        try:
+                                            cv2.putText(display_bgr, str(obj_id+1), (cx_i+8, cy_i-8), cv2.FONT_HERSHEY_SIMPLEX, 0.5, text_bgr, 1, cv2.LINE_AA)
+                                        except Exception:
+                                            pass
+                                else:
+                                    if is_selected:
+                                        x_half = x_size + 8
+                                        cv2.line(display_bgr, (cx_i - x_half, cy_i - x_half), (cx_i + x_half, cy_i + x_half), gold_bgr, 8)
+                                        cv2.line(display_bgr, (cx_i - x_half, cy_i + x_half), (cx_i + x_half, cy_i - x_half), gold_bgr, 8)
+                                        cv2.line(display_bgr, (cx_i - x_half + 4, cy_i - x_half + 4), (cx_i + x_half - 4, cy_i + x_half - 4), color_bgr, 6)
+                                        cv2.line(display_bgr, (cx_i - x_half + 4, cy_i + x_half - 4), (cx_i + x_half - 4, cy_i - x_half + 4), color_bgr, 6)
+                                        try:
+                                            cv2.putText(display_bgr, str(obj_id+1), (cx_i+x_half+2, cy_i-x_half-2), cv2.FONT_HERSHEY_SIMPLEX, 0.7, text_bgr, 3, cv2.LINE_AA)
+                                        except Exception:
+                                            pass
+                                    else:
+                                        x_half = x_size // 2
+                                        cv2.line(display_bgr, (cx_i - x_half, cy_i - x_half), (cx_i + x_half, cy_i + x_half), color_bgr, 4)
+                                        cv2.line(display_bgr, (cx_i - x_half, cy_i + x_half), (cx_i + x_half, cy_i - x_half), color_bgr, 4)
+                                        cv2.line(display_bgr, (cx_i - x_half, cy_i - x_half), (cx_i + x_half, cy_i + x_half), outline_bgr, 1)
+                                        cv2.line(display_bgr, (cx_i - x_half, cy_i + x_half), (cx_i + x_half, cy_i - x_half), outline_bgr, 1)
+                                        try:
+                                            cv2.putText(display_bgr, str(obj_id+1), (cx_i+x_half+2, cy_i-x_half-2), cv2.FONT_HERSHEY_SIMPLEX, 0.5, text_bgr, 1, cv2.LINE_AA)
+                                        except Exception:
+                                            pass
                         except Exception:
-                            pass
-                    
-                    # Draw resampled points as red circles (larger)
-                    for pt in resampled_points:
-                        try:
-                            cv2.circle(img_bgr, pt, 3, red_bgr, -1)
-                        except Exception:
-                            pass
-                # Convert back to RGB
-                img_rgb = cv2.cvtColor(img_bgr, cv2.COLOR_BGR2RGB)
-                img_rgb = np.ascontiguousarray(img_rgb)
+                            continue
+                    display_rgb = cv2.cvtColor(display_bgr, cv2.COLOR_BGR2RGB)
+                    display_rgb = np.ascontiguousarray(display_rgb)
+
+                dh, dw, dch = display_rgb.shape
+                q_img = QImage(display_rgb.data, dw, dh, dch * dw, QImage.Format_RGB888)
+                pixmap = QPixmap.fromImage(q_img)
+                scaled_pixmap = pixmap  # already label-sized; no further scaling needed
+
+            else:
+                # zoom_level == 1.0: keep the existing full-image scaling path unchanged
+                h, w, ch = img_rgb.shape
+                bytes_per_line = ch * w
                 q_img = QImage(img_rgb.data, w, h, bytes_per_line, QImage.Format_RGB888)
 
-            pixmap = QPixmap.fromImage(q_img)
-            scaled_pixmap = pixmap.scaled(self.image_label.size(), Qt.KeepAspectRatio, Qt.SmoothTransformation)
+                # Draw prompt markers for any frame that has prompts
+                all_obj_ids = self.get_all_object_ids()
+                has_prompts = any(len(self.get_prompts_for_object_in_frame(obj_id, idx)) > 0 for obj_id in all_obj_ids)
+                
+                if has_prompts:
+                    # Draw filled circles for positive and X markers for negative prompts
+                    # Convert RGB->BGR for OpenCV drawing, then back to RGB
+                    img_bgr = cv2.cvtColor(img_rgb, cv2.COLOR_RGB2BGR)
+                    circle_radius = max(1, int(round(self.prompt_point_size)))
+                    x_size = max(1, int(round(self.prompt_point_size * 1.2)))
+                    # bright red in BGR for selection highlight
+                    gold_bgr = (0, 0, 255)
+                    text_bgr = (255, 255, 255)
+                    outline_bgr = (0, 0, 0)
+
+                    for obj_id in all_obj_ids:
+                        skeleton_pts = self.get_prompts_for_object_in_frame(obj_id, idx)
+                        if not skeleton_pts:
+                            continue
+                        try:
+                            is_selected = (self.selected_object_idx is not None and self.selected_object_idx == obj_id)
+                            color_rgb = tuple(map(int, self.colors[(obj_id + 1) % len(self.colors)]))
+                            color_bgr = (int(color_rgb[2]), int(color_rgb[1]), int(color_rgb[0]))
+                            for ((cx, cy), label) in skeleton_pts:
+                                cx_i = int(cx)
+                                cy_i = int(cy)
+                                
+                                if label == 1:
+                                    # Positive prompt: draw circle
+                                    if is_selected:
+                                        # draw red outer ring then inner filled color to emphasize selection
+                                        sel_radius = circle_radius + 12
+                                        inner_radius = circle_radius + 4
+                                        cv2.circle(img_bgr, (cx_i, cy_i), sel_radius, gold_bgr, -1)
+                                        cv2.circle(img_bgr, (cx_i, cy_i), inner_radius, color_bgr, -1)
+                                        cv2.circle(img_bgr, (cx_i, cy_i), inner_radius, outline_bgr, 4)
+                                        try:
+                                            cv2.putText(img_bgr, str(obj_id+1), (cx_i+inner_radius+2, cy_i-inner_radius-2), cv2.FONT_HERSHEY_SIMPLEX, 0.7, text_bgr, 3, cv2.LINE_AA)
+                                        except Exception:
+                                            pass
+                                    else:
+                                        cv2.circle(img_bgr, (cx_i, cy_i), circle_radius, color_bgr, -1)
+                                        cv2.circle(img_bgr, (cx_i, cy_i), circle_radius, outline_bgr, 1)
+                                        try:
+                                            cv2.putText(img_bgr, str(obj_id+1), (cx_i+8, cy_i-8), cv2.FONT_HERSHEY_SIMPLEX, 0.5, text_bgr, 1, cv2.LINE_AA)
+                                        except Exception:
+                                            pass
+                                else:
+                                    # Negative prompt: draw X
+                                    if is_selected:
+                                        # draw thick X with gold outline
+                                        x_half = x_size + 8
+                                        cv2.line(img_bgr, (cx_i - x_half, cy_i - x_half), (cx_i + x_half, cy_i + x_half), gold_bgr, 8)
+                                        cv2.line(img_bgr, (cx_i - x_half, cy_i + x_half), (cx_i + x_half, cy_i - x_half), gold_bgr, 8)
+                                        cv2.line(img_bgr, (cx_i - x_half + 4, cy_i - x_half + 4), (cx_i + x_half - 4, cy_i + x_half - 4), color_bgr, 6)
+                                        cv2.line(img_bgr, (cx_i - x_half + 4, cy_i + x_half - 4), (cx_i + x_half - 4, cy_i - x_half + 4), color_bgr, 6)
+                                        try:
+                                            cv2.putText(img_bgr, str(obj_id+1), (cx_i+x_half+2, cy_i-x_half-2), cv2.FONT_HERSHEY_SIMPLEX, 0.7, text_bgr, 3, cv2.LINE_AA)
+                                        except Exception:
+                                            pass
+                                    else:
+                                        x_half = x_size // 2
+                                        cv2.line(img_bgr, (cx_i - x_half, cy_i - x_half), (cx_i + x_half, cy_i + x_half), color_bgr, 4)
+                                        cv2.line(img_bgr, (cx_i - x_half, cy_i + x_half), (cx_i + x_half, cy_i - x_half), color_bgr, 4)
+                                        cv2.line(img_bgr, (cx_i - x_half, cy_i - x_half), (cx_i + x_half, cy_i + x_half), outline_bgr, 1)
+                                        cv2.line(img_bgr, (cx_i - x_half, cy_i + x_half), (cx_i + x_half, cy_i - x_half), outline_bgr, 1)
+                                        try:
+                                            cv2.putText(img_bgr, str(obj_id+1), (cx_i+x_half+2, cy_i-x_half-2), cv2.FONT_HERSHEY_SIMPLEX, 0.5, text_bgr, 1, cv2.LINE_AA)
+                                        except Exception:
+                                            pass
+                        except Exception:
+                            continue
+                    # convert back to RGB for Qt
+                    img_rgb = cv2.cvtColor(img_bgr, cv2.COLOR_BGR2RGB)
+                    img_rgb = np.ascontiguousarray(img_rgb)
+                    q_img = QImage(img_rgb.data, w, h, bytes_per_line, QImage.Format_RGB888)
+                
+                # Draw centerlines if available for this frame and checkbox is checked
+                show_centerlines = getattr(self, 'show_centerlines_checkbox', None)
+                if idx in self.centerlines and show_centerlines and show_centerlines.isChecked():
+                    img_bgr = cv2.cvtColor(img_rgb, cv2.COLOR_RGB2BGR)
+                    centerline_dict = self.centerlines[idx]
+                    pink_bgr = (255, 192, 203)
+                    red_bgr = (0, 0, 255)
+                    for obj_id, centerline_data in centerline_dict.items():
+                        if isinstance(centerline_data, tuple) and len(centerline_data) == 2:
+                            full_skeleton, resampled_points = centerline_data
+                        else:
+                            full_skeleton = centerline_data if centerline_data else []
+                            resampled_points = centerline_data if centerline_data else []
+                        # Draw full skeleton as a polyline (much faster than per-point circles)
+                        if full_skeleton:
+                            try:
+                                pts = np.array(full_skeleton, dtype=np.int32).reshape(-1, 1, 2)
+                                cv2.polylines(img_bgr, [pts], False, pink_bgr, 1)
+                            except Exception:
+                                pass
+                        # Draw resampled points as red circles
+                        if resampled_points:
+                            try:
+                                for pt in resampled_points:
+                                    cv2.circle(img_bgr, pt, 3, red_bgr, -1)
+                            except Exception:
+                                pass
+                    img_rgb = cv2.cvtColor(img_bgr, cv2.COLOR_BGR2RGB)
+                    img_rgb = np.ascontiguousarray(img_rgb)
+                    q_img = QImage(img_rgb.data, w, h, bytes_per_line, QImage.Format_RGB888)
+
+                pixmap = QPixmap.fromImage(q_img)
+                scaled_pixmap = pixmap.scaled(self.image_label.size(), Qt.KeepAspectRatio, Qt.SmoothTransformation)
 
             # cache scaled pixmap
             try:
@@ -2207,7 +2927,16 @@ class C_Elegans_GUI(QMainWindow):
     def keyPressEvent(self, event):
         """Handle left/right arrow keys to navigate frames."""
         key = event.key()
-        if key == Qt.Key_Right:
+        if key in (Qt.Key_Plus, Qt.Key_Equal):
+            self._apply_zoom_step(+0.25)
+            return
+        elif key == Qt.Key_Minus:
+            self._apply_zoom_step(-0.25)
+            return
+        elif key == Qt.Key_0:
+            self._reset_zoom()
+            return
+        elif key == Qt.Key_Right:
             # move forward one frame
             if self.current_frame_idx < self.slider.maximum():
                 self.slider.setValue(self.current_frame_idx + 1)
@@ -2220,43 +2949,23 @@ class C_Elegans_GUI(QMainWindow):
             super().keyPressEvent(event)
 
     def _on_mask_saved(self, frame_idx, mask_path):
-        """Called when a single mask is saved during tracking.
-        Update mask index and display if on that frame.
-        """
+        """Called when a single mask is saved during tracking. Update mask index."""
         try:
-            # Add to mask index
             self.tracking_mask_files[frame_idx] = mask_path
-            # Clear cached mask for this frame
-            self._mask_cache.pop(frame_idx, None)
-            # Clear cached pixmap for this frame so it reloads with mask
-            self.pixmap_cache.pop(frame_idx, None)
-            
-            # Update image loader references
-            self._image_loader.set_references(
-                image_files=self.image_files, 
-                mask_files=self.tracking_mask_files, 
-                h5_path=getattr(self, 'h5_file_path', None), 
-                h5_dataset=getattr(self, 'h5_dataset_name', None),
-                gui_instance=self
-            )
-            
-            # Navigate to this frame and display the new mask
+            # Invalidate blended composite so next render picks up the new mask
+            self._blended_cache.pop(frame_idx, None)
+            self._raw_frame_cache.pop(frame_idx, None)
             self.slider.setValue(frame_idx)
         except Exception:
             pass
     
     def _on_centerline_computed(self, frame_idx, centerline_dict):
-        """Called when centerlines are computed for a frame.
-        Store centerlines and trigger redraw if viewing this frame.
-        """
+        """Called when centerlines are computed for a frame."""
         try:
-            # Store centerlines for this frame
             self.centerlines[frame_idx] = centerline_dict
-            # Clear cached pixmap so centerlines get drawn
             self.pixmap_cache.pop(frame_idx, None)
-            # If viewing this frame, request reload to draw centerlines
             if frame_idx == self.current_frame_idx:
-                self._image_loader.request(frame_idx)
+                self._render_current_frame_sync()
         except Exception:
             pass
 
@@ -2278,17 +2987,12 @@ class C_Elegans_GUI(QMainWindow):
                         continue
                     new_masks[idx] = os.path.join(mask_folder, fname)
 
-        # Drop any cached masks for frames that were just regenerated, then merge.
-        for idx in new_masks.keys():
-            try:
-                self._mask_cache.pop(idx, None)
-            except Exception:
-                pass
+        # Merge new masks into tracking_mask_files (used for prompt seeding)
         self.tracking_mask_files.update(new_masks)
 
-        # update image loader references to include mask files
+        # update image loader references
         try:
-            self._image_loader.set_references(image_files=self.image_files, mask_files=self.tracking_mask_files, h5_path=getattr(self, 'h5_file_path', None), h5_dataset=getattr(self, 'h5_dataset_name', None), gui_instance=self)
+            self._image_loader.set_references(image_files=self.image_files, mask_files=self.tracking_mask_files, h5_path=getattr(self, 'h5_file_path', None), h5_dataset=getattr(self, 'h5_dataset_name', None))
         except Exception:
             pass
 
@@ -2301,165 +3005,79 @@ class C_Elegans_GUI(QMainWindow):
             self.btn_stop.setEnabled(False)
         except Exception:
             pass
-        # Clear any cached scaled pixmaps (they were created without masks)
-        try:
-            self.pixmap_cache.clear()
-        except Exception:
-            self.pixmap_cache = {}
-
-        # Prefetch current frame (so the masked version loads) and update display
-        try:
-            self._image_loader.request(self.current_frame_idx)
-            self._prefetch_neighbors(self.current_frame_idx)
-        except Exception:
-            pass
-
         self.update_display()
-
-    def _on_realtime_frame(self, idx, color_mask_bgr):
-        """Receive per-frame color mask from realtime worker and display it immediately."""
-        try:
-            # read base image for this frame (folder-backed)
-            if self.image_files:
-                img_path = self.image_files[idx]
-                img = cv2.imread(img_path)
-            elif getattr(self, 'h5_file_path', None) and H5PY_AVAILABLE:
-                # load from HDF5 directly for display
-                try:
-                    with h5py.File(self.h5_file_path, 'r') as f:
-                        ds = self.h5_dataset_name if getattr(self, 'h5_dataset_name', None) is not None else next(iter(f.keys()))
-                        arr = np.asarray(f[ds][idx])
-                        if arr.ndim == 2:
-                            img = cv2.cvtColor(arr.astype(np.uint8), cv2.COLOR_GRAY2BGR)
-                        else:
-                            if arr.dtype != np.uint8:
-                                m = arr.max() if arr.max() != 0 else 1.0
-                                img = (255.0 * (arr.astype(np.float32) / m)).astype(np.uint8)
-                            else:
-                                img = arr.astype(np.uint8)
-                            if img.shape[2] == 3:
-                                # assume RGB in HDF5
-                                img = cv2.cvtColor(img, cv2.COLOR_RGB2BGR)
-                except Exception:
-                    return
-            else:
-                return
-
-            if img is None:
-                return
-
-            # compose color mask onto image (both BGR)
-            mask = color_mask_bgr
-            if mask.shape[:2] != img.shape[:2]:
-                mask = cv2.resize(mask, (img.shape[1], img.shape[0]), interpolation=cv2.INTER_NEAREST)
-            mask_indices = np.any(mask != [0, 0, 0], axis=-1)
-            composed = img.copy()
-            # Use dynamic opacity from slider
-            opacity = getattr(self, 'mask_opacity', 0.5)
-            composed[mask_indices] = cv2.addWeighted(composed[mask_indices], 1.0 - opacity, mask[mask_indices], opacity, 0)
-
-            # convert to RGB and display
-            img_rgb = cv2.cvtColor(composed, cv2.COLOR_BGR2RGB)
-            img_rgb = np.ascontiguousarray(img_rgb)
-            h, w, ch = img_rgb.shape
-            bytes_per_line = ch * w
-            q_img = QImage(img_rgb.data, w, h, bytes_per_line, QImage.Format_RGB888)
-            pixmap = QPixmap.fromImage(q_img)
-            scaled = pixmap.scaled(self.image_label.size(), Qt.KeepAspectRatio, Qt.SmoothTransformation)
-
-            # cache it (LRU)
-            try:
-                if len(self.pixmap_cache) >= self.pixmap_cache_max:
-                    try:
-                        self.pixmap_cache.popitem(last=False)
-                    except Exception:
-                        first_key = next(iter(self.pixmap_cache))
-                        self.pixmap_cache.pop(first_key, None)
-                self.pixmap_cache[idx] = scaled
-                try:
-                    self.pixmap_cache.move_to_end(idx, last=True)
-                except Exception:
-                    pass
-            except Exception:
-                self.pixmap_cache[idx] = scaled
-
-            # display and advance slider
-            self.current_frame_idx = idx
-            try:
-                self.image_label.setPixmap(scaled)
-            except Exception:
-                pass
-            try:
-                # update slider without causing heavy prefetch churn
-                self.slider.setValue(idx)
-            except Exception:
-                pass
-        except Exception:
-            pass
 
     def eventFilter(self, obj, event):
         # handle hover and clicks on the image label
         try:
             if obj == self.image_label:
-                # Mouse move: detect hover over any plotted prompt point
+                # Wheel: zoom in/out centered on cursor
+                if event.type() == QEvent.Wheel:
+                    delta = event.angleDelta().y()
+                    if delta > 0:
+                        self._apply_zoom_step(+0.25, event.pos())
+                    elif delta < 0:
+                        self._apply_zoom_step(-0.25, event.pos())
+                    return True
+
+                # Middle/Right button press: start pan drag
+                if event.type() == QEvent.MouseButtonPress and event.button() in (Qt.MiddleButton, Qt.RightButton):
+                    if self.image_label.pixmap() is None:
+                        return False
+                    if self.zoom_level > 1.0:
+                        self._pan_start_pos = event.pos()
+                        return True
+                    return False
+
+                # Mouse move: handle pan drag or hover detection
                 if event.type() == QEvent.MouseMove:
+                    # Pan drag handling
+                    if self._pan_start_pos is not None:
+                        dx = event.pos().x() - self._pan_start_pos.x()
+                        dy = event.pos().y() - self._pan_start_pos.y()
+                        if self._last_loaded_rgb is not None:
+                            orig_h, orig_w = self._last_loaded_rgb.shape[:2]
+                            label_w = self.image_label.width()
+                            label_h = self.image_label.height()
+                            base_scale = min(label_w / orig_w, label_h / orig_h)
+                            viewport_w = label_w / (base_scale * self.zoom_level)
+                            viewport_h = label_h / (base_scale * self.zoom_level)
+                            new_pan_x = self.pan_offset[0] - dx * viewport_w / label_w
+                            new_pan_y = self.pan_offset[1] - dy * viewport_h / label_h
+                            self.pan_offset = (new_pan_x, new_pan_y)
+                            self._clamp_pan_offset(orig_w, orig_h)
+                            if self.current_frame_idx in self.pixmap_cache:
+                                self.pixmap_cache.pop(self.current_frame_idx, None)
+                            self._render_current_frame_sync()
+                        self._pan_start_pos = event.pos()
+                        return True
                     # reset hover
                     self._hovered_point = None
                     pixmap = self.image_label.pixmap()
-                    # get prompts for current frame
                     prompts = self.get_prompts_for_frame(self.current_frame_idx)
                     if pixmap is None or not any(prompts):
                         self.image_label.setCursor(Qt.ArrowCursor)
                         return False
 
+                    if self._last_loaded_rgb is None:
+                        self.image_label.setCursor(Qt.ArrowCursor)
+                        return False
+
+                    orig_h, orig_w = self._last_loaded_rgb.shape[:2]
                     label_w = self.image_label.width()
                     label_h = self.image_label.height()
-                    pixmap_w = pixmap.width()
-                    pixmap_h = pixmap.height()
-                    offset_x = max(0, (label_w - pixmap_w) // 2)
-                    offset_y = max(0, (label_h - pixmap_h) // 2)
-
+                    zoom_level = getattr(self, 'zoom_level', 1.0)
+                    pan_offset = getattr(self, 'pan_offset', (0.0, 0.0))
                     pos = event.pos()
-                    x_in = pos.x() - offset_x
-                    y_in = pos.y() - offset_y
-                    if x_in < 0 or y_in < 0 or x_in >= pixmap_w or y_in >= pixmap_h:
-                        self.image_label.setCursor(Qt.ArrowCursor)
-                        return False
-
-                    # get original image size
-                    try:
-                        if self._last_loaded_rgb is not None:
-                            orig_h, orig_w = self._last_loaded_rgb.shape[:2]
-                        elif getattr(self, 'h5_file_path', None) is not None and H5PY_AVAILABLE:
-                            try:
-                                with h5py.File(self.h5_file_path, 'r') as f:
-                                    ds = self.h5_dataset_name if getattr(self, 'h5_dataset_name', None) is not None else next(iter(f.keys()))
-                                    arr = f[ds][self.current_frame_idx]
-                                    tmp = np.asarray(arr)
-                                    orig_h, orig_w = tmp.shape[:2]
-                            except Exception:
-                                self.image_label.setCursor(Qt.ArrowCursor)
-                                return False
-                        else:
-                            orig = cv2.imread(self.image_files[self.current_frame_idx])
-                            orig_h, orig_w = orig.shape[:2]
-                    except Exception:
-                        self.image_label.setCursor(Qt.ArrowCursor)
-                        return False
-
-                    # compute scale from original->pixmap (preserve aspect ratio so scales equal)
-                    scale_x = pixmap_w / float(orig_w)
-                    scale_y = pixmap_h / float(orig_h)
-                    scale = min(scale_x, scale_y)
-
-                    # threshold in display pixels for selecting a point
                     thr = 12
                     found = False
-                    # iterate over all points to find nearest
                     for obj_idx, pts in enumerate(prompts):
                         for pt_idx, ((cx, cy), label) in enumerate(pts):
-                            disp_x = int(cx * scale) + offset_x
-                            disp_y = int(cy * scale) + offset_y
+                            try:
+                                disp_x, disp_y = CoordinateMapper.image_to_display(
+                                    cx, cy, label_w, label_h, orig_w, orig_h, zoom_level, pan_offset)
+                            except Exception:
+                                continue
                             dx = disp_x - pos.x()
                             dy = disp_y - pos.y()
                             if dx*dx + dy*dy <= thr*thr:
@@ -2513,8 +3131,12 @@ class C_Elegans_GUI(QMainWindow):
                         else:
                             orig_h, orig_w = self._last_loaded_rgb.shape[:2]
 
-                        x_orig = int((x_in * orig_w) / pixmap_w)
-                        y_orig = int((y_in * orig_h) / pixmap_h)
+                        x_orig, y_orig = CoordinateMapper.display_to_image(
+                            pos.x(), pos.y(), label_w, label_h, orig_w, orig_h,
+                            self.zoom_level, self.pan_offset
+                        )
+                        x_orig = int(x_orig)
+                        y_orig = int(y_orig)
 
                         # create new object with initial prompt at current frame (positive by default)
                         new_obj_id = self.create_new_object(self.current_frame_idx, [((x_orig, y_orig), 1)])
@@ -2546,14 +3168,12 @@ class C_Elegans_GUI(QMainWindow):
                         except Exception:
                             pass
 
-                        # refresh UI (invalidate cache and request recomposition)
+                        # refresh UI
                         try:
                             self.update_object_sidebar()
-                            if self.current_frame_idx in self.pixmap_cache:
-                                self.pixmap_cache.pop(self.current_frame_idx, None)
-                            self._image_loader.request(self.current_frame_idx)
+                            self.pixmap_cache.pop(self.current_frame_idx, None)
+                            self._render_current_frame_sync()
                             self._prefetch_neighbors(self.current_frame_idx)
-                            self.update_display()
                             self.status_label.setText("Deleted prompt point")
                         except Exception:
                             pass
@@ -2593,8 +3213,12 @@ class C_Elegans_GUI(QMainWindow):
                         except Exception:
                             return True
 
-                        x_orig = int((x_in * orig_w) / pixmap_w)
-                        y_orig = int((y_in * orig_h) / pixmap_h)
+                        x_orig, y_orig = CoordinateMapper.display_to_image(
+                            pos.x(), pos.y(), label_w, label_h, orig_w, orig_h,
+                            self.zoom_level, self.pan_offset
+                        )
+                        x_orig = int(x_orig)
+                        y_orig = int(y_orig)
 
                         try:
                             # append to selected object's prompt list for current frame with current mode
@@ -2618,6 +3242,11 @@ class C_Elegans_GUI(QMainWindow):
                             pass
                         return True
 
+                # Middle/Right button release: end pan drag
+                if event.type() == QEvent.MouseButtonRelease and event.button() in (Qt.MiddleButton, Qt.RightButton):
+                    self._pan_start_pos = None
+                    return False
+
                 # end mouse press handling
         except Exception:
             pass
@@ -2634,19 +3263,6 @@ class C_Elegans_GUI(QMainWindow):
             if hasattr(self, 'worker') and getattr(self, 'worker') is not None:
                 try:
                     self.worker.terminate()
-                except Exception:
-                    pass
-        except Exception:
-            pass
-        # Stop realtime worker if running
-        try:
-            if hasattr(self, '_realtime_worker') and getattr(self, '_realtime_worker') is not None:
-                try:
-                    try:
-                        self._realtime_worker.stop()
-                    except Exception:
-                        pass
-                    self._realtime_worker.wait(1000)
                 except Exception:
                     pass
         except Exception:
@@ -2671,26 +3287,6 @@ class C_Elegans_GUI(QMainWindow):
             self.btn_stop.setEnabled(False)
         except Exception:
             pass
-
-    def _on_h5_export_finished(self, temp_folder):
-        """Called when ExportH5Worker finishes exporting frames to `temp_folder`."""
-        try:
-            self._h5_export_tempdir = temp_folder
-            # determine requested start/end from spinboxes (if present)
-            try:
-                start_frame = int(self.start_spin.value()) if hasattr(self, 'start_spin') else 0
-                end_frame = int(self.end_spin.value()) if hasattr(self, 'end_spin') else None
-            except Exception:
-                start_frame = 0
-                end_frame = None
-            # start tracker with the exported folder and requested range
-            print(f"starting tracker for frames {start_frame} to {end_frame} after export")
-            print(f"temp folder: {temp_folder}")
-            self._start_tracker_worker(temp_folder, start_frame=start_frame, end_frame=end_frame)
-        except Exception as e:
-            QMessageBox.critical(self, "Error", f"Failed to start tracker after export: {e}")
-            self.btn_track.setEnabled(True)
-            self.btn_autosegment.setEnabled(True)
 
     def _on_h5_export_ready(self, temp_folder):
         """Called when exporter has written an initial batch of frames and the tracker can start."""
@@ -2727,43 +3323,6 @@ class C_Elegans_GUI(QMainWindow):
                 child_layout = item.layout()
                 if child_layout is not None:
                     self.clear_layout(child_layout)
-
-
-    def toggle_realtime_pause(self):
-        """Toggle pause/resume of the realtime tracker worker."""
-        try:
-            worker = getattr(self, '_realtime_worker', None)
-            if worker is None:
-                return
-            if getattr(worker, '_paused', False):
-                try:
-                    worker.resume()
-                    self.btn_pause_realtime.setText("Pause Tracking")
-                    self.status_label.setText("Real-time tracking: resumed")
-                except Exception:
-                    pass
-            else:
-                try:
-                    worker.pause()
-                    self.btn_pause_realtime.setText("Resume Tracking")
-                    self.status_label.setText("Real-time tracking: paused")
-                except Exception:
-                    pass
-        except Exception:
-            pass
-        # close any open HDF5 handle
-        try:
-            if getattr(self, '_h5f', None) is not None:
-                try:
-                    self._h5f.close()
-                except Exception:
-                    pass
-                self._h5f = None
-        except Exception:
-            pass
-        self.wait()
-
-
 
     # overlay helper was removed per user request
 
@@ -2848,10 +3407,6 @@ class C_Elegans_GUI(QMainWindow):
             has_objects = len(self.get_all_object_ids()) > 0
             try:
                 self.btn_track.setEnabled(has_objects)
-            except Exception:
-                pass
-            try:
-                self.btn_track_realtime.setEnabled(has_objects)
             except Exception:
                 pass
         except Exception:
@@ -2993,7 +3548,7 @@ class C_Elegans_GUI(QMainWindow):
         self._image_loader.request(self.current_frame_idx)
         self._prefetch_neighbors(self.current_frame_idx)
 
-        # Show a lightweight placeholder while loading
+        # Show placeholder while waiting for the loader.
         self.image_label.setText("Loading...")
         # Note: actual composition/blending happens in background loader to minimize UI thread work
 
