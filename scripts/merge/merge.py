@@ -1,5 +1,12 @@
 """ 
-Merges the SAM2 masks (in JPG format) into a single folder of PNG masks, with the same frame index as the original video frames. This is done by taking the left half of the SAM2 mask (which corresponds to the original video frame) and saving it as a binary PNG mask. The output PNG files are named with the frame index followed by "_mask.png" (e.g., "2001_mask.png").
+Merges the SAM2 masks (in JPG format) into a single folder of PNG masks, with the same frame index as the original video frames. 
+This is done by taking the left half of the SAM2 mask (which corresponds to the original video frame) and saving it as a binary PNG mask.
+The output PNG files are named with the frame index followed by "_mask.png" (e.g., "2001_mask.png").
+
+To run: open terminal and execute 
+`python merge.py <sam2_dir> <output_dir>`
+- sam2_dir: the directory containing the output masks from SAM2 in JPG format
+- output_dir: the directory where the merged PNG masks will be saved
 """
 
 import os

@@ -1,5 +1,5 @@
 
-An interactive GUI to use SAM2 for segmentation of objects across video. Designed for .hdf5 data
+An interactive GUI to use SAM2 for segmentation of objects across video. Best used with .hdf5 data.
 - includes a module to convert folder of tiff images to hdf5
 - supports folder of .png images, but slower
 
